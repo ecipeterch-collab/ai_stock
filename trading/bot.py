@@ -1,0 +1,340 @@
+from __future__ import annotations
+
+import json
+import threading
+import time
+from typing import Callable
+
+import requests
+
+from config.config import (
+    auto_interval_sec,
+    auto_max_buys_per_day,
+    default_order_qty,
+    dmst_stex_tp,
+    notify_on_auto_events_only,
+    telegram_chat_id,
+    telegram_token,
+    use_paper,
+)
+from kiwoom.client import KiwoomAPIError, KiwoomClient
+from telegram.tel_send import send_message
+from trading.strategy import AutoTradingStrategy
+
+GET_UPDATES_URL = f"https://api.telegram.org/bot{telegram_token}/getUpdates"
+TARGET_CHAT_ID = int(telegram_chat_id)
+POLL_TIMEOUT = 30
+
+
+class TelegramTradingBot:
+    """텔레그램 명령으로 키움 API 매매를 제어하는 봇."""
+
+    def __init__(self) -> None:
+        self.client = KiwoomClient()
+        self.strategy = AutoTradingStrategy(self.client)
+        self._auto_thread: threading.Thread | None = None
+        self._stop_auto = threading.Event()
+
+    def notify(self, text: str) -> None:
+        send_message(text)
+
+    def _commands(self) -> dict[str, Callable[[list[str]], str]]:
+        return {
+            "/help": self._cmd_help,
+            "/도움": self._cmd_help,
+            "/status": self._cmd_status,
+            "/상태": self._cmd_status,
+            "/balance": self._cmd_balance,
+            "/잔고": self._cmd_balance,
+            "/rank": self._cmd_rank,
+            "/순위": self._cmd_rank,
+            "/buy": self._cmd_buy,
+            "/매수": self._cmd_buy,
+            "/sell": self._cmd_sell,
+            "/매도": self._cmd_sell,
+            "/auto": self._cmd_auto,
+            "/자동": self._cmd_auto,
+            "/strategy": self._cmd_strategy,
+            "/전략": self._cmd_strategy,
+            "/news": self._cmd_news,
+            "/뉴스": self._cmd_news,
+            "/report": self._cmd_report,
+            "/리포트": self._cmd_report,
+            "/trend": self._cmd_trend,
+            "/트렌드": self._cmd_trend,
+            "/trendbuy": self._cmd_trend_buy,
+            "/트렌드매수": self._cmd_trend_buy,
+        }
+
+    def _cmd_help(self, _args: list[str]) -> str:
+        mode = "모의투자" if use_paper else "실전투자"
+        return (
+            f"키움 자동매매 봇 ({mode})\n\n"
+            "/status - 예수금·주문가능금액\n"
+            "/balance - 보유 종목\n"
+            "/rank - 거래대금 상위 5\n"
+            "/strategy - 매매 전략 규칙\n"
+            "/news - 시장·경제·지정학 뉴스 브리핑\n"
+            "/buy 종목코드 [수량] - 시장가 매수\n"
+            "/sell 종목코드 [수량] - 시장가 매도\n"
+            "/auto on|off - 자동매매 (이벤트만 알림)\n"
+            "/report - 뉴스·잔고·점검 수동 리포트\n"
+            "/trend - 글로벌 트렌드·저가 후보 소개\n"
+            "/trendbuy - 트렌드 1위 종목 매수\n"
+            "/help - 명령어 목록"
+        )
+
+    def _cmd_trend(self, args: list[str]) -> str:
+        if args and args[0].lower() in ("buy", "매수"):
+            return self._cmd_trend_buy([])
+        return self.strategy.get_trend_report()
+
+    def _cmd_trend_buy(self, _args: list[str]) -> str:
+        return self.strategy.trend_buy_best()
+
+    def _cmd_report(self, _args: list[str]) -> str:
+        return self.strategy.build_manual_report()
+
+    def _cmd_strategy(self, _args: list[str]) -> str:
+        return self.strategy.get_rules_summary()
+
+    def _cmd_news(self, _args: list[str]) -> str:
+        return self.strategy.get_news_briefing()
+
+    def _cmd_status(self, _args: list[str]) -> str:
+        deposit = self.client.get_deposit()
+        fmt = self.client.format_amount
+        return (
+            "【계좌 상태】\n"
+            f"예수금: {fmt(deposit.get('entr', '0'))}원\n"
+            f"주문가능: {fmt(deposit.get('ord_alow_amt', '0'))}원\n"
+            f"출금가능: {fmt(deposit.get('pymn_alow_amt', '0'))}원"
+        )
+
+    def _cmd_balance(self, _args: list[str]) -> str:
+        holdings = self.client.get_holdings()
+        if not holdings:
+            return "보유 종목이 없습니다."
+
+        lines = ["【보유 종목】"]
+        for item in holdings:
+            code = self.client.normalize_stock_code(item.get("stk_cd", ""))
+            name = item.get("stk_nm", code)
+            qty = item.get("rmnd_qty", "0")
+            price = item.get("cur_prc", "0")
+            profit = item.get("prft_rt", "0")
+            lines.append(f"- {name}({code}) {qty}주 @ {price} ({profit}%)")
+        return "\n".join(lines)
+
+    def _cmd_rank(self, _args: list[str]) -> str:
+        items = self.client.get_trade_value_rank(top_n=5)
+        if not items:
+            return "순위 데이터가 없습니다."
+
+        lines = ["【거래대금 상위 5】"]
+        for item in items:
+            rank = item.get("now_rank", "?")
+            name = item.get("stk_nm", "")
+            code = self.client.normalize_stock_code(item.get("stk_cd", ""))
+            price = item.get("cur_prc", "")
+            amount = item.get("trde_prica", "")
+            lines.append(f"{rank}. {name}({code}) {price} / {amount}")
+        return "\n".join(lines)
+
+    def _cmd_buy(self, args: list[str]) -> str:
+        if not args:
+            return "사용법: /buy 종목코드 [수량]"
+        code = self.client.normalize_stock_code(args[0])
+        qty = int(args[1]) if len(args) > 1 else default_order_qty
+        result = self.client.buy_market(code, qty, dmst_stex_tp=dmst_stex_tp)
+        ord_no = result.get("ord_no", "")
+        lines = [
+            f"[매수] {code} {qty}주",
+            f"{result.get('return_msg', '')} (주문번호: {ord_no})",
+        ]
+        fill_msg = self.strategy.check_order_fill(ord_no, code)
+        if fill_msg:
+            lines.append(fill_msg)
+            threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()
+        return "\n".join(lines)
+
+    def _cmd_sell(self, args: list[str]) -> str:
+        if not args:
+            return "사용법: /sell 종목코드 [수량]"
+        code = self.client.normalize_stock_code(args[0])
+        qty = int(args[1]) if len(args) > 1 else default_order_qty
+
+        holdings = self.client.get_holdings()
+        sellable = 0
+        for item in holdings:
+            if self.client.normalize_stock_code(item.get("stk_cd", "")) == code:
+                sellable = self.client.parse_qty(item.get("trde_able_qty", "0"))
+                break
+        if sellable <= 0:
+            return (
+                f"【매도 불가】 {code}\n"
+                "매매가능수량 0주입니다. (결제 대기·미체결 확인)"
+            )
+        if qty > sellable:
+            qty = sellable
+
+        result = self.client.sell_market(code, qty, dmst_stex_tp=dmst_stex_tp)
+        ord_no = result.get("ord_no", "")
+        lines = [
+            f"[매도] {code} {qty}주",
+            f"{result.get('return_msg', '')} (주문번호: {ord_no})",
+        ]
+        fill_msg = self.strategy.check_order_fill(ord_no, code, sell_tp="1")
+        if fill_msg:
+            lines.append(fill_msg)
+            threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()
+        return "\n".join(lines)
+
+    def _cmd_auto(self, args: list[str]) -> str:
+        if not args:
+            state = "ON" if self.strategy.enabled else "OFF"
+            return f"자동매매: {state}\n사용법: /auto on 또는 /auto off"
+
+        action = args[0].lower()
+        if action in ("on", "start", "1"):
+            self.strategy.enable()
+            self._start_auto_loop()
+            threading.Thread(
+                target=self._run_auto_cycle_silent_check,
+                daemon=True,
+            ).start()
+            return (
+                f"자동매매 시작 ({auto_interval_sec}초 주기)\n"
+                "알림: 체결·매수·매도·실패 시에만 전송\n"
+                "전체 현황: /report"
+            )
+        if action in ("off", "stop", "0"):
+            self.strategy.disable()
+            self._stop_auto_loop()
+            return "자동매매 중지"
+        return "사용법: /auto on 또는 /auto off"
+
+    def _notify_cycle_events(self, result) -> None:
+        messages = (
+            result.events
+            if notify_on_auto_events_only
+            else result.messages
+        )
+        for message in messages:
+            self.notify(message)
+
+    def _run_auto_cycle_silent_check(self) -> None:
+        """주기 점검: 이벤트(체결·주문·실패)만 텔레그램 전송."""
+        try:
+            result = self.strategy.run_cycle()
+            self._notify_cycle_events(result)
+        except requests.RequestException as exc:
+            self.notify(f"자동매매 통신 오류: {exc}")
+
+    def _start_auto_loop(self) -> None:
+        if self._auto_thread and self._auto_thread.is_alive():
+            return
+        self._stop_auto.clear()
+
+        def loop() -> None:
+            while not self._stop_auto.is_set():
+                if self._stop_auto.wait(auto_interval_sec):
+                    break
+                if self.strategy.enabled:
+                    self._run_auto_cycle_silent_check()
+
+        self._auto_thread = threading.Thread(target=loop, daemon=True)
+        self._auto_thread.start()
+
+    def _stop_auto_loop(self) -> None:
+        self._stop_auto.set()
+
+    def handle_command(self, text: str) -> str | None:
+        text = text.strip()
+        if not text.startswith("/"):
+            return None
+
+        parts = text.split()
+        command = parts[0].split("@")[0]
+        args = parts[1:]
+
+        handler = self._commands().get(command)
+        if not handler:
+            return f"알 수 없는 명령: {command}\n/help 로 명령어를 확인하세요."
+
+        try:
+            return handler(args)
+        except KiwoomAPIError as exc:
+            return f"API 오류: {exc}"
+        except requests.HTTPError as exc:
+            status = exc.response.status_code if exc.response is not None else "?"
+            return f"HTTP 오류 ({status}): {exc}"
+        except requests.RequestException as exc:
+            return f"네트워크 오류: {exc}"
+        except (ValueError, IndexError) as exc:
+            return f"입력 오류: {exc}"
+
+    def _fetch_updates(self, offset: int | None) -> list[dict]:
+        params: dict = {"timeout": POLL_TIMEOUT}
+        if offset is not None:
+            params["offset"] = offset
+
+        response = requests.get(
+            GET_UPDATES_URL,
+            params=params,
+            timeout=POLL_TIMEOUT + 10,
+        )
+        response.raise_for_status()
+        data = response.json()
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API 오류: {json.dumps(data, ensure_ascii=False)}")
+        return data.get("result", [])
+
+    def _skip_backlog(self) -> int | None:
+        updates = self._fetch_updates(offset=None)
+        if not updates:
+            return None
+        return updates[-1]["update_id"] + 1
+
+    def _handle_update(self, update: dict) -> None:
+        message = update.get("message")
+        if not message:
+            return
+        if message.get("chat", {}).get("id") != TARGET_CHAT_ID:
+            return
+        if (message.get("from") or {}).get("is_bot"):
+            return
+
+        text = message.get("text")
+        if not text:
+            return
+
+        print(f"수신: {text!r}")
+        reply = self.handle_command(text)
+        if reply:
+            print(f"응답: {reply[:80]}...")
+            send_message(reply)
+
+    def run(self) -> None:
+        offset = self._skip_backlog()
+        mode = "모의투자" if use_paper else "실전투자"
+        startup = f"키움 자동매매 봇 시작 ({mode})\n/help 로 명령어를 확인하세요."
+        print(startup)
+        self.notify(startup)
+        print(f"채팅 {TARGET_CHAT_ID} 명령 대기 중... (종료: Ctrl+C)")
+
+        while True:
+            try:
+                updates = self._fetch_updates(offset)
+                for update in updates:
+                    self._handle_update(update)
+                    offset = update["update_id"] + 1
+            except KeyboardInterrupt:
+                self.strategy.disable()
+                self._stop_auto_loop()
+                self.notify("자동매매 봇을 종료합니다.")
+                print("\n종료합니다.")
+                break
+            except requests.RequestException as exc:
+                print(f"요청 오류, 5초 후 재시도: {exc}")
+                time.sleep(5)

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.*
+
+# Secrets (use config/config.example.py as template)
+config/config.py
+*_appkey.txt
+*_secretkey.txt
+66476338_*.txt
+
+# Runtime data
+data/positions.json
+
+# IDE (optional local settings)
+.vscode/
