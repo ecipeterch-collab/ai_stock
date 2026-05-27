@@ -8,8 +8,6 @@ from typing import Callable
 import requests
 
 from config.config import (
-    auto_interval_sec,
-    auto_max_buys_per_day,
     default_order_qty,
     dmst_stex_tp,
     notify_on_auto_events_only,
@@ -19,10 +17,24 @@ from config.config import (
 )
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from telegram.tel_send import send_message
+from trading.runtime_config import effective_auto_interval_sec, is_scalping_mode
 from trading.strategy import AutoTradingStrategy
 
-GET_UPDATES_URL = f"https://api.telegram.org/bot{telegram_token}/getUpdates"
-TARGET_CHAT_ID = int(telegram_chat_id)
+def _get_updates_url() -> str:
+    if not telegram_token:
+        return ""
+    return f"https://api.telegram.org/bot{telegram_token}/getUpdates"
+
+
+def _target_chat_id() -> int | None:
+    try:
+        return int(str(telegram_chat_id).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+GET_UPDATES_URL = _get_updates_url()
+TARGET_CHAT_ID = _target_chat_id()
 POLL_TIMEOUT = 30
 
 
@@ -68,16 +80,18 @@ class TelegramTradingBot:
 
     def _cmd_help(self, _args: list[str]) -> str:
         mode = "모의투자" if use_paper else "실전투자"
+        strat = "스캘핑" if is_scalping_mode() else "스윙"
+        interval = effective_auto_interval_sec()
         return (
-            f"키움 자동매매 봇 ({mode})\n\n"
+            f"키움 자동매매 봇 ({mode} · {strat})\n\n"
             "/status - 예수금·주문가능금액\n"
             "/balance - 보유 종목\n"
             "/rank - 거래대금 상위 5\n"
-            "/strategy - 매매 전략 규칙\n"
+            f"/strategy - {strat} 매매 규칙\n"
             "/news - 시장·경제·지정학 뉴스 브리핑\n"
             "/buy 종목코드 [수량] - 시장가 매수\n"
             "/sell 종목코드 [수량] - 시장가 매도\n"
-            "/auto on|off - 자동매매 (이벤트만 알림)\n"
+            f"/auto on|off - 자동매매 ({interval}초 주기, 이벤트만 알림)\n"
             "/report - 뉴스·잔고·점검 수동 리포트\n"
             "/trend - 글로벌 트렌드·저가 후보 소개\n"
             "/trendbuy - 트렌드 1위 종목 매수\n"
@@ -204,7 +218,8 @@ class TelegramTradingBot:
                 daemon=True,
             ).start()
             return (
-                f"자동매매 시작 ({auto_interval_sec}초 주기)\n"
+                f"자동매매 시작 ({effective_auto_interval_sec()}초 · "
+                f"{'스캘핑' if is_scalping_mode() else '스윙'})\n"
                 "알림: 체결·매수·매도·실패 시에만 전송\n"
                 "전체 현황: /report"
             )
@@ -238,7 +253,7 @@ class TelegramTradingBot:
 
         def loop() -> None:
             while not self._stop_auto.is_set():
-                if self._stop_auto.wait(auto_interval_sec):
+                if self._stop_auto.wait(effective_auto_interval_sec()):
                     break
                 if self.strategy.enabled:
                     self._run_auto_cycle_silent_check()
@@ -275,6 +290,8 @@ class TelegramTradingBot:
             return f"입력 오류: {exc}"
 
     def _fetch_updates(self, offset: int | None) -> list[dict]:
+        if not GET_UPDATES_URL:
+            raise RuntimeError("Telegram token 미설정")
         params: dict = {"timeout": POLL_TIMEOUT}
         if offset is not None:
             params["offset"] = offset
@@ -300,7 +317,7 @@ class TelegramTradingBot:
         message = update.get("message")
         if not message:
             return
-        if message.get("chat", {}).get("id") != TARGET_CHAT_ID:
+        if TARGET_CHAT_ID is None or message.get("chat", {}).get("id") != TARGET_CHAT_ID:
             return
         if (message.get("from") or {}).get("is_bot"):
             return
@@ -316,6 +333,11 @@ class TelegramTradingBot:
             send_message(reply)
 
     def run(self) -> None:
+        if not telegram_token or TARGET_CHAT_ID is None:
+            raise RuntimeError(
+                "텔레그램 설정이 비어 있습니다. "
+                "config/local_secrets.py 또는 환경변수(TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN)를 설정하세요."
+            )
         offset = self._skip_backlog()
         mode = "모의투자" if use_paper else "실전투자"
         startup = f"키움 자동매매 봇 시작 ({mode})\n/help 로 명령어를 확인하세요."

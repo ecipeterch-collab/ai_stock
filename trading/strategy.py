@@ -7,27 +7,33 @@ from datetime import date, datetime
 import requests
 
 from config.config import (
-    auto_max_buys_per_day,
     default_order_qty,
     dmst_stex_tp,
     fill_poll_interval_sec,
     fill_poll_wait_sec,
     news_defensive_loss_pct,
     news_enabled,
+    news_override_when_market_bullish,
+    news_override_disable_buy_block,
+    news_override_disable_defensive_mode,
+    news_override_max_risk_score,
+    scalping_disable_trend_buy,
+    scalping_max_flu_rt,
+    scalping_max_hold_minutes,
+    scalping_min_flu_rt,
+    scalping_min_rank_improve,
+    scalping_min_score,
+    scalping_quick_profit_pct,
+    scalping_reentry_cooldown_minutes,
+    scalping_scan_rank_top,
+    scalping_stop_loss_pct,
+    scalping_take_profit_pct,
+    scalping_trend_max_buys_per_day,
     strategy_breakeven_activate_pct,
     strategy_breakeven_floor_pct,
-    strategy_buy_afternoon_end,
-    strategy_buy_afternoon_start,
-    strategy_buy_morning_end,
-    strategy_buy_morning_start,
-    strategy_eod_cut_loss_time,
     strategy_eod_sell_enabled,
-    strategy_eod_sell_time,
-    strategy_max_positions,
     strategy_min_score,
     strategy_partial_sell_ratio,
-    strategy_portfolio_heat_limit,
-    strategy_portfolio_heat_pct,
     strategy_scan_rank_top,
     strategy_stop_loss_pct,
     strategy_take_profit_partial_pct,
@@ -50,12 +56,28 @@ from trading.scoring import (
     filter_and_rank_candidates,
     is_market_bullish,
 )
+from trading.runtime_config import (
+    effective_auto_interval_sec,
+    effective_buy_windows,
+    effective_eod_times,
+    effective_max_buys_per_day,
+    effective_max_positions,
+    effective_portfolio_heat,
+    is_scalping_mode,
+)
+from trading.scalping import (
+    evaluate_scalp_sell,
+    filter_scalp_candidates,
+    is_scalp_market_bullish,
+)
+from trading.trade_journal import TradeJournal
 from trading.trend_scanner import TrendPick, TrendScanner
 
 # 텔레그램 자동 알림 대상 (이벤트만)
 EVENT_PREFIXES = (
     "【체결",
     "【자동매수",
+    "【스캘핑 매수",
     "【트렌드 매수",
     "【자동매도",
     "【매수 실패",
@@ -109,10 +131,13 @@ class AutoTradingStrategy:
         self.enabled = False
         self._buy_count_date: date | None = None
         self._buy_count = 0
+        self._trend_buy_count_date: date | None = None
+        self._trend_buy_count = 0
         self._seen_fill_keys: set[str] = set()
         self.positions = PositionTracker()
         self.news = MarketNewsAnalyzer()
         self.trends = TrendScanner(client)
+        self.journal = TradeJournal()
 
     def enable(self) -> None:
         self.enabled = True
@@ -121,21 +146,39 @@ class AutoTradingStrategy:
         self.enabled = False
 
     def get_rules_summary(self) -> str:
+        if is_scalping_mode():
+            ms, me, as_, ae = effective_buy_windows()
+            cut, eod = effective_eod_times()
+            return (
+                "【스캘핑 전략】\n\n"
+                f"점검 주기: {effective_auto_interval_sec()}초\n"
+                f"동시 보유: 최대 {effective_max_positions()}종목\n"
+                f"일일 매수: 최대 {effective_max_buys_per_day()}회\n\n"
+                "■ 매도 (보유 우선)\n"
+                f"  · 익절: +{scalping_take_profit_pct}% / 빠른익절 +{scalping_quick_profit_pct}%\n"
+                f"  · 손절: -{scalping_stop_loss_pct}%\n"
+                f"  · 보유 {scalping_max_hold_minutes}분 초과 시 전량 청산\n"
+                f"  · 트레일링·모멘텀 둔화·장마감 {eod} 청산\n\n"
+                "■ 매수\n"
+                f"  · 거래대금 상위 {scalping_scan_rank_top} · 점수 ≥{scalping_min_score}\n"
+                f"  · 등락 {scalping_min_flu_rt}~{scalping_max_flu_rt}% · 순위급등 ≥{scalping_min_rank_improve}\n"
+                f"  · 시간: {ms}~{me}, {as_}~{ae}\n\n"
+                "■ 모드 전환: config.py → strategy_mode = \"swing\" | \"scalping\"\n"
+                "■ /auto on · /report"
+            )
         return (
-            "【매매 전략 v3】\n\n"
+            "【매매 전략 v3 · 스윙】\n\n"
             "■ 매도 (보유 점검 우선)\n"
             f"  · 1차 익절: +{strategy_take_profit_partial_pct}% → "
             f"{int(strategy_partial_sell_ratio * 100)}% 물량 매도\n"
             f"  · 최종 익절: +{strategy_take_profit_pct}% → 전량 매도\n"
             f"  · 손절: -{strategy_stop_loss_pct}% → 전량 매도\n"
-            f"  · 트레일링/본전스탑/방어모드/장마감 청산\n"
-            "  · 종목코드 A005930 형식 → 005930 변환 후 주문\n\n"
+            f"  · 트레일링/본전스탑/방어모드/장마감 청산\n\n"
             "■ 매수: 거래대금·점수·뉴스 필터\n"
             "■ 트렌드: 글로벌 핫테마 + 연관종목 눌림목 매수\n"
             "  · /trend 소개 · /trend buy 수동매수\n\n"
-            "■ 알림\n"
-            "  · /auto on: 체결·매수·매도·실패만 자동 알림\n"
-            "  · /report: 뉴스·잔고·점검 수동 리포트"
+            "■ 모드: config.py → strategy_mode = \"scalping\"\n"
+            "■ /auto on · /report"
         )
 
     def get_news_briefing(self) -> str:
@@ -152,7 +195,7 @@ class AutoTradingStrategy:
             return intro + "\n\n매수할 트렌드 종목이 없습니다."
 
         if not self._can_buy_today():
-            return intro + f"\n\n일일 매수 한도 도달 ({auto_max_buys_per_day}회)"
+            return intro + f"\n\n일일 매수 한도 도달 ({effective_max_buys_per_day()}회)"
 
         pick = scan.picks[0]
         internal = AutoRunResult()
@@ -171,6 +214,7 @@ class AutoTradingStrategy:
             lines.append(self._portfolio_summary(holdings, 0))
         except (KiwoomAPIError, requests.RequestException) as exc:
             lines.append(f"잔고 조회 실패: {exc}")
+        lines.append(self.journal.format_recent_summary(10))
         lines.append(
             self._heartbeat(
                 "수동 리포트",
@@ -184,14 +228,27 @@ class AutoTradingStrategy:
         if self._buy_count_date != today:
             self._buy_count_date = today
             self._buy_count = 0
+        if self._trend_buy_count_date != today:
+            self._trend_buy_count_date = today
+            self._trend_buy_count = 0
 
     def _can_buy_today(self) -> bool:
         self._reset_daily_counter()
-        return self._buy_count < auto_max_buys_per_day
+        return self._buy_count < effective_max_buys_per_day()
 
     def _record_buy(self) -> None:
         self._reset_daily_counter()
         self._buy_count += 1
+
+    def _record_trend_buy(self) -> None:
+        self._reset_daily_counter()
+        self._trend_buy_count += 1
+
+    def _can_trend_buy_today(self) -> bool:
+        self._reset_daily_counter()
+        if is_scalping_mode():
+            return self._trend_buy_count < scalping_trend_max_buys_per_day
+        return True
 
     @staticmethod
     def _fill_key(fill: dict) -> str:
@@ -232,6 +289,21 @@ class AutoTradingStrategy:
                 continue
             self._seen_fill_keys.add(key)
             result.add_event(self._format_fill_message(fill))
+            try:
+                code = self.client.normalize_stock_code(fill.get("stk_cd", ""))
+                name = fill.get("stk_nm", code)
+                qty = self.client.parse_qty(fill.get("cntr_qty", "0"))
+                price = self.client.parse_price(fill.get("cntr_pric", "0"))
+                self.journal.log(
+                    "fill",
+                    code=code,
+                    name=name,
+                    qty=qty if qty > 0 else None,
+                    price=price if price > 0 else None,
+                    ord_no=str(fill.get("ord_no", "")),
+                )
+            except Exception:
+                pass
 
     def _parse_holdings(self) -> list[HoldingView]:
         holdings: list[HoldingView] = []
@@ -295,12 +367,14 @@ class AutoTradingStrategy:
     def _is_eod_cut_loss_time(self, now: datetime | None = None) -> bool:
         if not strategy_eod_sell_enabled:
             return False
-        return (now or datetime.now()).time() >= parse_hhmm(strategy_eod_cut_loss_time)
+        cut, _ = effective_eod_times()
+        return (now or datetime.now()).time() >= parse_hhmm(cut)
 
     def _is_eod_sell_all_time(self, now: datetime | None = None) -> bool:
         if not strategy_eod_sell_enabled:
             return False
-        return (now or datetime.now()).time() >= parse_hhmm(strategy_eod_sell_time)
+        _, eod = effective_eod_times()
+        return (now or datetime.now()).time() >= parse_hhmm(eod)
 
     def _evaluate_sell(
         self,
@@ -313,15 +387,28 @@ class AutoTradingStrategy:
         if sellable <= 0:
             return None, 0
 
+        if is_scalping_mode():
+            hold_min = self.positions.holding_minutes(holding.code)
+            return evaluate_scalp_sell(
+                profit,
+                sellable,
+                state,
+                hold_min,
+                is_eod_sell_all=self._is_eod_sell_all_time(),
+                is_eod_cut_loss=self._is_eod_cut_loss_time(),
+            )
+
         qty = sellable
         peak = state.peak_profit_pct if state else profit
         partial_sold = state.partial_sold if state else False
 
         if self._is_eod_sell_all_time():
-            return f"장마감 전량 청산 ({strategy_eod_sell_time})", qty
+            _, eod = effective_eod_times()
+            return f"장마감 전량 청산 ({eod})", qty
 
         if self._is_eod_cut_loss_time() and profit < 0:
-            return f"장마감 손실 정리 ({strategy_eod_cut_loss_time})", qty
+            cut, _ = effective_eod_times()
+            return f"장마감 손실 정리 ({cut})", qty
 
         if profit <= -strategy_stop_loss_pct:
             return f"손절 ({profit:.2f}% <= -{strategy_stop_loss_pct}%)", qty
@@ -395,6 +482,19 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             ord_no = order.get("ord_no", "")
+            try:
+                self.journal.log(
+                    "sell_order",
+                    code=holding.code,
+                    name=holding.name,
+                    qty=sell_qty,
+                    price=holding.current_price or None,
+                    profit_pct=holding.profit_pct,
+                    reason=reason,
+                    ord_no=ord_no,
+                )
+            except Exception:
+                pass
             result.add_event(
                 "【자동매도】\n"
                 f"사유: {reason}\n"
@@ -418,6 +518,7 @@ class AutoTradingStrategy:
             if partial:
                 self.positions.mark_partial_sold(holding.code)
             if sell_qty >= holding.sellable_qty:
+                self.positions.mark_exit(holding.code)
                 self.positions.remove(holding.code)
             return True
         except KiwoomAPIError as exc:
@@ -472,10 +573,9 @@ class AutoTradingStrategy:
         return sold_count
 
     def _portfolio_heat_blocks_buy(self, holdings: list[HoldingView]) -> str | None:
-        losers = [
-            h for h in holdings if h.profit_pct <= strategy_portfolio_heat_pct
-        ]
-        if len(losers) >= strategy_portfolio_heat_limit:
+        heat_limit, heat_pct = effective_portfolio_heat()
+        losers = [h for h in holdings if h.profit_pct <= heat_pct]
+        if len(losers) >= heat_limit:
             names = ", ".join(h.name for h in losers[:3])
             return f"손실 종목 {len(losers)}개 ({names}) - 신규매수 중단"
         return None
@@ -497,28 +597,23 @@ class AutoTradingStrategy:
             )
             return
 
-        if len(holdings) >= strategy_max_positions:
+        max_pos = effective_max_positions()
+        if len(holdings) >= max_pos:
             result.add_report(
-                self._heartbeat(f"보유 한도 ({len(holdings)}/{strategy_max_positions})")
+                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
             )
             return
 
         if not self._can_buy_today():
-            result.add_report(self._heartbeat(f"일일 매수 한도 ({auto_max_buys_per_day}회)"))
+            result.add_report(
+                self._heartbeat(f"일일 매수 한도 ({effective_max_buys_per_day()}회)")
+            )
             return
 
-        if not is_buy_window(
-            strategy_buy_morning_start,
-            strategy_buy_morning_end,
-            strategy_buy_afternoon_start,
-            strategy_buy_afternoon_end,
-        ):
+        ms, me, as_, ae = effective_buy_windows()
+        if not is_buy_window(ms, me, as_, ae):
             result.add_report(
-                self._heartbeat(
-                    f"매수시간 외 "
-                    f"({strategy_buy_morning_start}~{strategy_buy_morning_end}, "
-                    f"{strategy_buy_afternoon_start}~{strategy_buy_afternoon_end})"
-                )
+                self._heartbeat(f"매수시간 외 ({ms}~{me}, {as_}~{ae})")
             )
             return
 
@@ -527,33 +622,58 @@ class AutoTradingStrategy:
             result.add_report(self._heartbeat(heat))
             return
 
+        scan_top = scalping_scan_rank_top if is_scalping_mode() else strategy_scan_rank_top
+        min_score = scalping_min_score if is_scalping_mode() else strategy_min_score
+
         try:
-            rank_items = self.client.get_trade_value_rank(
-                top_n=strategy_scan_rank_top,
-            )
+            rank_items = self.client.get_trade_value_rank(top_n=scan_top)
             candidates = self._parse_candidates(rank_items)
         except (KiwoomAPIError, requests.RequestException) as exc:
             result.add_report(self._heartbeat(f"순위 조회 실패 - {exc}"))
             return
 
-        bullish, market_msg = is_market_bullish(candidates)
+        if is_scalping_mode():
+            bullish, market_msg = is_scalp_market_bullish(candidates)
+            filter_fn = filter_scalp_candidates
+        else:
+            bullish, market_msg = is_market_bullish(candidates)
+            filter_fn = filter_and_rank_candidates
+
         if not bullish:
             result.add_report(self._heartbeat(f"매수 보류 - {market_msg}"))
             return
 
-        eligible, rejected = filter_and_rank_candidates(candidates, held_codes)
+        eligible, rejected = filter_fn(candidates, held_codes)
         if not eligible:
             detail = rejected[0] if rejected else "조건 충족 없음"
             result.add_report(self._heartbeat(f"매수 보류 - {detail}"))
             return
 
+        # 스캘핑: 청산 직후 동일 종목 재진입 쿨다운
+        if is_scalping_mode() and scalping_reentry_cooldown_minutes > 0:
+            cooled: list[str] = []
+            filtered: list[tuple[CandidateView, float]] = []
+            for cand, score in eligible:
+                since = self.positions.cooldown_minutes_since_exit(cand.code)
+                if since is not None and since < scalping_reentry_cooldown_minutes:
+                    cooled.append(
+                        f"{cand.name}({cand.code}) {since:.0f}분 < {scalping_reentry_cooldown_minutes}분"
+                    )
+                    continue
+                filtered.append((cand, score))
+            if not filtered:
+                note = cooled[0] if cooled else "쿨다운"
+                result.add_report(self._heartbeat(f"재진입 쿨다운 - {note}"))
+                return
+            eligible = filtered
+
         best, score = eligible[0]
         news_adj = news.score_adjustment if news else 0.0
         adjusted = score + news_adj
-        if adjusted < strategy_min_score:
+        if adjusted < min_score:
             result.add_report(
                 self._heartbeat(
-                    f"점수 부족 - {best.name} {adjusted:.1f} < {strategy_min_score}점"
+                    f"점수 부족 - {best.name} {adjusted:.1f} < {min_score}점"
                 )
             )
             return
@@ -569,20 +689,20 @@ class AutoTradingStrategy:
         holdings: list[HoldingView],
         news: MarketNewsContext | None = None,
     ) -> None:
+        if is_scalping_mode() and scalping_disable_trend_buy:
+            return
         if not trend_auto_buy_enabled:
             return
         if news and not news.allow_buy:
             return
-        if len(holdings) >= strategy_max_positions:
+        if not self._can_trend_buy_today():
+            return
+        if len(holdings) >= effective_max_positions():
             return
         if not self._can_buy_today():
             return
-        if not is_buy_window(
-            strategy_buy_morning_start,
-            strategy_buy_morning_end,
-            strategy_buy_afternoon_start,
-            strategy_buy_afternoon_end,
-        ):
+        ms, me, as_, ae = effective_buy_windows()
+        if not is_buy_window(ms, me, as_, ae):
             return
         if not is_market_open():
             return
@@ -595,6 +715,10 @@ class AutoTradingStrategy:
         for pick in scan.picks:
             if pick.code in held:
                 continue
+            if is_scalping_mode() and scalping_reentry_cooldown_minutes > 0:
+                since = self.positions.cooldown_minutes_since_exit(pick.code)
+                if since is not None and since < scalping_reentry_cooldown_minutes:
+                    continue
             self._execute_trend_buy(pick, result)
             result.add_report(
                 self._heartbeat(
@@ -612,8 +736,21 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             self._record_buy()
+            self._record_trend_buy()
             ord_no = order.get("ord_no", "")
             self.positions.register(pick.code, pick.name, pick.current_price)
+            try:
+                self.journal.log(
+                    "trend_buy_order",
+                    code=pick.code,
+                    name=pick.name,
+                    qty=default_order_qty,
+                    price=pick.current_price,
+                    reason=f"[{pick.theme_name}] {pick.reason}",
+                    ord_no=ord_no,
+                )
+            except Exception:
+                pass
             msg = (
                 "【트렌드 매수】\n"
                 f"테마: {pick.theme_name}\n"
@@ -656,8 +793,21 @@ class AutoTradingStrategy:
                 candidate.name,
                 candidate.current_price,
             )
+            try:
+                self.journal.log(
+                    "buy_order",
+                    code=candidate.code,
+                    name=candidate.name,
+                    qty=default_order_qty,
+                    price=candidate.current_price,
+                    reason=market_msg,
+                    ord_no=ord_no,
+                )
+            except Exception:
+                pass
+            buy_tag = "【스캘핑 매수】" if is_scalping_mode() else "【자동매수】"
             buy_msg = (
-                "【자동매수】\n"
+                f"{buy_tag}\n"
                 f"종목: {candidate.name}({candidate.code})\n"
                 f"점수: {score:.1f}점 · {market_msg}\n"
             )
@@ -719,11 +869,12 @@ class AutoTradingStrategy:
 
     def _heartbeat(self, action: str, target: str = "") -> str:
         self._reset_daily_counter()
+        mode = "스캘핑" if is_scalping_mode() else "스윙"
         lines = [
-            "【자동매매 점검】",
+            f"【자동매매 점검 · {mode}】",
             f"시각: {datetime.now():%Y-%m-%d %H:%M:%S}",
             f"장: {market_status_text()}",
-            f"매수: {self._buy_count}/{auto_max_buys_per_day}회",
+            f"매수: {self._buy_count}/{effective_max_buys_per_day()}회",
             f"조치: {action}",
         ]
         if target:
@@ -735,17 +886,20 @@ class AutoTradingStrategy:
         holdings: list[HoldingView],
         sold_count: int,
     ) -> str:
+        max_pos = effective_max_positions()
         lines = [
             "【포트폴리오】",
-            f"보유 {len(holdings)}/{strategy_max_positions} · 매도 {sold_count}건",
+            f"보유 {len(holdings)}/{max_pos} · 매도 {sold_count}건",
         ]
         for h in holdings[:5]:
             state = self.positions.get(h.code)
             peak = state.peak_profit_pct if state else h.profit_pct
+            hold = self.positions.holding_minutes(h.code)
+            hold_txt = f" · 보유 {hold:.0f}분" if hold is not None else ""
             lines.append(
                 f"  {h.name}({h.code}) {h.qty}주 "
                 f"매매가능 {h.sellable_qty}주 "
-                f"{h.profit_pct:+.2f}% (고점 {peak:+.2f}%)"
+                f"{h.profit_pct:+.2f}% (고점 {peak:+.2f}%){hold_txt}"
             )
         if not holdings:
             lines.append("  보유 없음")
@@ -766,6 +920,41 @@ class AutoTradingStrategy:
         holdings: list[HoldingView] = []
 
         if is_market_open():
+            # 시장이 강세일 때는 뉴스로 인한 신규매수 중단/방어모드를 완화
+            if news_override_when_market_bullish and news_enabled:
+                try:
+                    scan_top = (
+                        scalping_scan_rank_top
+                        if is_scalping_mode()
+                        else strategy_scan_rank_top
+                    )
+                    rank_items = self.client.get_trade_value_rank(top_n=scan_top)
+                    candidates = self._parse_candidates(rank_items)
+                    bullish, _ = (
+                        is_scalp_market_bullish(candidates)
+                        if is_scalping_mode()
+                        else is_market_bullish(candidates)
+                    )
+                    if bullish and news_ctx.risk_score < news_override_max_risk_score:
+                        changed = False
+                        notes: list[str] = []
+                        if news_override_disable_buy_block and not news_ctx.allow_buy:
+                            news_ctx.allow_buy = True
+                            changed = True
+                            notes.append("신규매수 중단 OFF")
+                        if (
+                            news_override_disable_defensive_mode
+                            and news_ctx.defensive_mode
+                        ):
+                            news_ctx.defensive_mode = False
+                            changed = True
+                            notes.append("방어모드 OFF")
+                        if changed:
+                            note = "강세장 감지 → 뉴스 override (" + ", ".join(notes) + ")"
+                            news_ctx.error = f"{news_ctx.error} | {note}".strip(" |")
+                except (KiwoomAPIError, requests.RequestException):
+                    pass
+
             sold_count = self._run_sell_phase(result, news_ctx)
             try:
                 holdings = self._parse_holdings()

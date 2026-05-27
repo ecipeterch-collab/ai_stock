@@ -28,24 +28,43 @@ class PositionTracker:
     def __init__(self, path: Path = POSITIONS_FILE) -> None:
         self.path = path
         self._positions: dict[str, PositionState] = {}
+        self._cooldowns: dict[str, str] = {}
         self.load()
 
     def load(self) -> None:
         if not self.path.exists():
             self._positions = {}
+            self._cooldowns = {}
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
-            self._positions = {
-                code: PositionState(**data)
-                for code, data in raw.items()
-            }
+            if isinstance(raw, dict) and "positions" in raw:
+                positions_raw = raw.get("positions") or {}
+                cooldowns_raw = raw.get("cooldowns") or {}
+                self._positions = {
+                    code: PositionState(**data)
+                    for code, data in positions_raw.items()
+                }
+                self._cooldowns = {
+                    str(code): str(ts) for code, ts in cooldowns_raw.items()
+                }
+            else:
+                # backward compatible: older format was {code: PositionState}
+                self._positions = {
+                    code: PositionState(**data)
+                    for code, data in (raw or {}).items()
+                }
+                self._cooldowns = {}
         except (json.JSONDecodeError, TypeError, KeyError):
             self._positions = {}
+            self._cooldowns = {}
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {code: asdict(state) for code, state in self._positions.items()}
+        payload = {
+            "positions": {code: asdict(state) for code, state in self._positions.items()},
+            "cooldowns": dict(self._cooldowns),
+        }
         self.path.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -96,6 +115,37 @@ class PositionTracker:
         if code in self._positions:
             del self._positions[code]
             self.save()
+        # positions 에 없더라도 cooldown 은 남겨둔다 (재진입 제한)
 
     def codes(self) -> set[str]:
         return set(self._positions.keys())
+
+    def holding_minutes(self, code: str, now: datetime | None = None) -> float | None:
+        state = self._positions.get(code)
+        if state is None:
+            return None
+        try:
+            entry = datetime.fromisoformat(state.entry_time)
+        except ValueError:
+            return None
+        current = now or datetime.now()
+        return (current - entry).total_seconds() / 60.0
+
+    def mark_exit(self, code: str, now: datetime | None = None) -> None:
+        """청산 시각 기록 (재진입 쿨다운용)."""
+        current = now or datetime.now()
+        self._cooldowns[code] = current.isoformat(timespec="seconds")
+        self.save()
+
+    def cooldown_minutes_since_exit(
+        self, code: str, now: datetime | None = None
+    ) -> float | None:
+        ts = self._cooldowns.get(code)
+        if not ts:
+            return None
+        try:
+            exited = datetime.fromisoformat(ts)
+        except ValueError:
+            return None
+        current = now or datetime.now()
+        return (current - exited).total_seconds() / 60.0

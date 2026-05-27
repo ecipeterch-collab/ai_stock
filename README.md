@@ -13,7 +13,8 @@
 ```bash
 pip install -r requirements.txt
 copy config\config.example.py config\config.py
-# config.py 에 API 키·텔레그램 정보 입력
+copy config\local_secrets.example.py config\local_secrets.py
+# local_secrets.py 에 API 키·텔레그램 정보 입력 (Git 제외)
 ```
 
 ## 실행
@@ -44,4 +45,4 @@ data/              # 포지션 추적 JSON
 
 ## 보안
 
-`config/config.py`, `*_appkey.txt`, `*_secretkey.txt` 는 Git에 포함되지 않습니다. GitHub에 올리기 전에 저장소가 **private** 인지 확인하세요.
+`config/local_secrets.py`, `.env*`, `*_appkey.txt`, `*_secretkey.txt` 는 Git에 포함되지 않습니다. GitHub에 올리기 전에 저장소가 **private** 인지 확인하세요.
