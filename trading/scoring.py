@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from config.config import (
+    strategy_block_leveraged_etf,
     strategy_max_flu_rt,
     strategy_min_bullish_count,
     strategy_min_flu_rt,
@@ -10,6 +11,7 @@ from config.config import (
     strategy_optimal_flu_rt,
     strategy_scan_rank_top,
 )
+from trading.symbol_filters import is_leveraged_etf
 
 
 @dataclass
@@ -52,15 +54,29 @@ def score_candidate(candidate: CandidateView) -> float:
     return rank_score + momentum_score + flu_score + liquidity_score * 0.1
 
 
+def market_bullish_stats(
+    candidates: list[CandidateView],
+    top_n: int | None = None,
+) -> tuple[int, int, float, str]:
+    """상위 종목 양봉 수·비율 (뉴스 override·약세 판정용)."""
+    limit = top_n if top_n is not None else strategy_scan_rank_top
+    top = candidates[:limit]
+    if not top:
+        return 0, 0, 0.0, "후보 없음"
+    bullish = sum(1 for c in top if c.flu_rt > 0)
+    ratio = bullish / len(top)
+    msg = f"{bullish}/{len(top)}종목 상승"
+    return bullish, len(top), ratio, msg
+
+
 def is_market_bullish(candidates: list[CandidateView]) -> tuple[bool, str]:
     """상위 종목 중 양봉 비율로 시장 분위기 판단."""
-    top = candidates[:strategy_scan_rank_top]
-    if not top:
+    bullish, total, _, msg = market_bullish_stats(candidates)
+    if total == 0:
         return False, "후보 없음"
-    bullish = sum(1 for c in top if c.flu_rt > 0)
     if bullish < strategy_min_bullish_count:
-        return False, f"약세장 ({bullish}/{len(top)}종목만 상승)"
-    return True, f"양호 ({bullish}/{len(top)}종목 상승)"
+        return False, f"약세장 ({msg})"
+    return True, f"양호 ({msg})"
 
 
 def filter_and_rank_candidates(
@@ -74,13 +90,16 @@ def filter_and_rank_candidates(
         if cand.code in held_codes:
             rejected.append(f"{cand.name}: 보유 중")
             continue
+        if strategy_block_leveraged_etf and is_leveraged_etf(cand.name, cand.code):
+            rejected.append(f"{cand.name}: 레버리지/인버스 ETF 제외")
+            continue
         if cand.flu_rt < strategy_min_flu_rt:
             rejected.append(f"{cand.name}: 등락률 {cand.flu_rt:.2f}% 낮음")
             continue
         if cand.flu_rt > strategy_max_flu_rt:
             rejected.append(f"{cand.name}: 등락률 {cand.flu_rt:.2f}% 과열")
             continue
-        if cand.rank_improve < strategy_min_rank_improve:
+        if cand.rank_improve < strategy_min_rank_improve and cand.rank > 5:
             rejected.append(
                 f"{cand.name}: 순위개선 부족 ({cand.prev_rank}→{cand.rank})"
             )

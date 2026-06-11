@@ -61,18 +61,24 @@ class TradeJournal:
             )
         )
 
-    def tail(self, n: int = 20) -> list[TradeEvent]:
+    def read_all(self) -> list[TradeEvent]:
         if not self.path.exists():
             return []
-        lines = self.path.read_text(encoding="utf-8").splitlines()
         out: list[TradeEvent] = []
-        for line in lines[-n:]:
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
             try:
                 raw = json.loads(line)
                 out.append(TradeEvent(**raw))
             except Exception:
                 continue
         return out
+
+    def tail(self, n: int = 20) -> list[TradeEvent]:
+        events = self.read_all()
+        return events[-n:] if n > 0 else []
 
     def format_recent_summary(self, n: int = 10) -> str:
         events = self.tail(n)

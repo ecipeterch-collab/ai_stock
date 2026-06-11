@@ -13,3 +13,8 @@ paper_app_secret = "YOUR_PAPER_APP_SECRET"
 telegram_chat_id = "YOUR_TELEGRAM_CHAT_ID"
 telegram_token = "YOUR_TELEGRAM_BOT_TOKEN"
 
+# 웹 대시보드 로그인 (config/local_secrets.py)
+web_username = "admin"
+web_password = "CHANGE_ME_STRONG_PASSWORD"
+web_secret_key = "CHANGE_ME_RANDOM_32_CHARS_OR_MORE"
+

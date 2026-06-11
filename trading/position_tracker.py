@@ -5,6 +5,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
+from kiwoom.client import KiwoomClient
+
 POSITIONS_FILE = Path(__file__).resolve().parent.parent / "data" / "positions.json"
 
 
@@ -14,8 +16,10 @@ class PositionState:
     name: str
     entry_time: str
     entry_price: int
+    entry_qty: int = 0
     peak_profit_pct: float = 0.0
     partial_sold: bool = False
+    tp_stage: int = 0  # 0: none, 1: stage1 done, 2: stage2 done
 
     def update_peak(self, profit_pct: float) -> None:
         if profit_pct > self.peak_profit_pct:
@@ -58,6 +62,32 @@ class PositionTracker:
         except (json.JSONDecodeError, TypeError, KeyError):
             self._positions = {}
             self._cooldowns = {}
+        self._normalize_codes()
+
+    def _normalize_codes(self) -> None:
+        """저장된 A접두 종목코드를 주문용 6자리로 통일."""
+        dirty = False
+        positions: dict[str, PositionState] = {}
+        for code, state in self._positions.items():
+            ncode = KiwoomClient.normalize_stock_code(code)
+            if ncode != code or state.code != ncode:
+                dirty = True
+            state.code = ncode
+            positions[ncode] = state
+        new_cooldowns = {
+            KiwoomClient.normalize_stock_code(code): ts
+            for code, ts in self._cooldowns.items()
+        }
+        if new_cooldowns != self._cooldowns:
+            dirty = True
+        self._positions = positions
+        self._cooldowns = new_cooldowns
+        if dirty:
+            self.save()
+
+    @staticmethod
+    def _norm(code: str) -> str:
+        return KiwoomClient.normalize_stock_code(code)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -71,20 +101,23 @@ class PositionTracker:
         )
 
     def get(self, code: str) -> PositionState | None:
-        return self._positions.get(code)
+        return self._positions.get(self._norm(code))
 
     def register(
         self,
         code: str,
         name: str,
         entry_price: int,
+        entry_qty: int = 0,
         profit_pct: float = 0.0,
     ) -> PositionState:
+        code = self._norm(code)
         state = PositionState(
             code=code,
             name=name,
             entry_time=datetime.now().isoformat(timespec="seconds"),
             entry_price=entry_price,
+            entry_qty=max(0, int(entry_qty)),
             peak_profit_pct=max(0.0, profit_pct),
         )
         self._positions[code] = state
@@ -98,20 +131,28 @@ class PositionTracker:
         purchase_price: int,
         profit_pct: float,
     ) -> PositionState:
+        code = self._norm(code)
         state = self._positions.get(code)
         if state is None:
-            state = self.register(code, name, purchase_price, profit_pct)
+            state = self.register(code, name, purchase_price, entry_qty=0, profit_pct=profit_pct)
         state.update_peak(profit_pct)
         self.save()
         return state
 
     def mark_partial_sold(self, code: str) -> None:
-        state = self._positions.get(code)
+        state = self._positions.get(self._norm(code))
         if state:
             state.partial_sold = True
             self.save()
 
+    def mark_tp_stage(self, code: str, stage: int) -> None:
+        state = self._positions.get(self._norm(code))
+        if state:
+            state.tp_stage = max(int(stage), state.tp_stage)
+            self.save()
+
     def remove(self, code: str) -> None:
+        code = self._norm(code)
         if code in self._positions:
             del self._positions[code]
             self.save()
@@ -121,7 +162,7 @@ class PositionTracker:
         return set(self._positions.keys())
 
     def holding_minutes(self, code: str, now: datetime | None = None) -> float | None:
-        state = self._positions.get(code)
+        state = self._positions.get(self._norm(code))
         if state is None:
             return None
         try:
@@ -134,13 +175,13 @@ class PositionTracker:
     def mark_exit(self, code: str, now: datetime | None = None) -> None:
         """청산 시각 기록 (재진입 쿨다운용)."""
         current = now or datetime.now()
-        self._cooldowns[code] = current.isoformat(timespec="seconds")
+        self._cooldowns[self._norm(code)] = current.isoformat(timespec="seconds")
         self.save()
 
     def cooldown_minutes_since_exit(
         self, code: str, now: datetime | None = None
     ) -> float | None:
-        ts = self._cooldowns.get(code)
+        ts = self._cooldowns.get(self._norm(code))
         if not ts:
             return None
         try:

@@ -171,14 +171,12 @@ class KiwoomClient:
 
     @staticmethod
     def normalize_stock_code(stk_cd: str) -> str:
-        """API 응답 종목코드 → 주문/조회용 6자리 코드 (예: A005930 → 005930)."""
-        code = stk_cd.split("_")[0].strip()
-        if (
-            len(code) == 7
-            and code[0] == "A"
-            and code[1:].isdigit()
-        ):
-            return code[1:]
+        """API 응답 종목코드 → 주문/조회용 6자리 코드 (예: A005930 → 005930, A0193W0 → 0193W0)."""
+        code = stk_cd.split("_")[0].strip().upper()
+        if len(code) == 7 and code[0] == "A":
+            body = code[1:]
+            if len(body) == 6 and body.isalnum():
+                return body
         return code
 
     @staticmethod

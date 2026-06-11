@@ -11,13 +11,25 @@ from config.config import (
     default_order_qty,
     dmst_stex_tp,
     notify_on_auto_events_only,
+    strategy_mode as config_strategy_mode,
     telegram_chat_id,
     telegram_token,
     use_paper,
 )
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from telegram.tel_send import send_message
-from trading.runtime_config import effective_auto_interval_sec, is_scalping_mode
+from trading.mode_settings import (
+    SETTINGS_FILE,
+    set_auto_trading_enabled,
+    set_strategy_mode,
+)
+from trading.runtime_config import (
+    effective_auto_interval_sec,
+    effective_max_buys_per_day,
+    get_strategy_mode,
+    mode_label,
+    set_strategy_mode,
+)
 from trading.strategy import AutoTradingStrategy
 
 def _get_updates_url() -> str:
@@ -46,6 +58,8 @@ class TelegramTradingBot:
         self.strategy = AutoTradingStrategy(self.client)
         self._auto_thread: threading.Thread | None = None
         self._stop_auto = threading.Event()
+        if not SETTINGS_FILE.exists():
+            set_strategy_mode(config_strategy_mode)
 
     def notify(self, text: str) -> None:
         send_message(text)
@@ -58,6 +72,9 @@ class TelegramTradingBot:
             "/상태": self._cmd_status,
             "/balance": self._cmd_balance,
             "/잔고": self._cmd_balance,
+            "/portfolio": self._cmd_portfolio,
+            "/포트폴리오": self._cmd_portfolio,
+            "/현황": self._cmd_portfolio,
             "/rank": self._cmd_rank,
             "/순위": self._cmd_rank,
             "/buy": self._cmd_buy,
@@ -68,6 +85,8 @@ class TelegramTradingBot:
             "/자동": self._cmd_auto,
             "/strategy": self._cmd_strategy,
             "/전략": self._cmd_strategy,
+            "/mode": self._cmd_mode,
+            "/모드": self._cmd_mode,
             "/news": self._cmd_news,
             "/뉴스": self._cmd_news,
             "/report": self._cmd_report,
@@ -76,17 +95,22 @@ class TelegramTradingBot:
             "/트렌드": self._cmd_trend,
             "/trendbuy": self._cmd_trend_buy,
             "/트렌드매수": self._cmd_trend_buy,
+            "/resetbuys": self._cmd_reset_buys,
+            "/리셋": self._cmd_reset_buys,
+            "/reset": self._cmd_reset_buys,
         }
 
     def _cmd_help(self, _args: list[str]) -> str:
         mode = "모의투자" if use_paper else "실전투자"
-        strat = "스캘핑" if is_scalping_mode() else "스윙"
+        strat = mode_label()
         interval = effective_auto_interval_sec()
         return (
             f"키움 자동매매 봇 ({mode} · {strat})\n\n"
-            "/status - 예수금·주문가능금액\n"
-            "/balance - 보유 종목\n"
+            "/status - 예수금·자동매매 상태\n"
+            "/balance - 보유 종목 (진입가·수익률)\n"
+            "/portfolio - 계좌·보유·매수상태·최근거래\n"
             "/rank - 거래대금 상위 5\n"
+            f"/mode - 전략 모드 (현재: {strat})\n"
             f"/strategy - {strat} 매매 규칙\n"
             "/news - 시장·경제·지정학 뉴스 브리핑\n"
             "/buy 종목코드 [수량] - 시장가 매수\n"
@@ -95,7 +119,19 @@ class TelegramTradingBot:
             "/report - 뉴스·잔고·점검 수동 리포트\n"
             "/trend - 글로벌 트렌드·저가 후보 소개\n"
             "/trendbuy - 트렌드 1위 종목 매수\n"
+            "/resetbuys - 일일 매수 제한 리셋\n"
             "/help - 명령어 목록"
+        )
+
+    def _cmd_reset_buys(self, _args: list[str]) -> str:
+        self.strategy.reset_daily_buy_limits()
+        return (
+            "일일 매수 제한을 리셋했습니다.\n"
+            "- 매수 카운터: 0\n"
+            "- 트렌드 매수 카운터: 0\n"
+            "- 급락 매수 카운터: 0\n"
+            "- 연속손실 브레이커: 해제\n"
+            "- 일일 손실 상한: 해제"
         )
 
     def _cmd_trend(self, args: list[str]) -> str:
@@ -109,6 +145,39 @@ class TelegramTradingBot:
     def _cmd_report(self, _args: list[str]) -> str:
         return self.strategy.build_manual_report()
 
+    def _cmd_mode(self, args: list[str]) -> str:
+        if not args:
+            mode = get_strategy_mode()
+            interval = effective_auto_interval_sec()
+            return (
+                f"【전략 모드】 {mode_label(mode)} ({mode})\n"
+                f"점검 주기: {interval}초\n"
+                f"일일 매수: 최대 {effective_max_buys_per_day()}회\n\n"
+                "변경: /mode swing 또는 /mode scalping\n"
+                "(한글: /mode 스윙 · /mode 스캘핑)"
+            )
+
+        try:
+            new_mode = set_strategy_mode(args[0])
+        except ValueError as exc:
+            return str(exc)
+
+        was_running = self.strategy.enabled
+        if was_running:
+            self._restart_auto_loop()
+
+        label = mode_label(new_mode)
+        interval = effective_auto_interval_sec()
+        lines = [
+            f"전략 모드를 {label}({new_mode})로 변경했습니다.",
+            f"점검 주기: {interval}초",
+        ]
+        if was_running:
+            lines.append("자동매매 루프를 새 모드로 재시작했습니다.")
+        else:
+            lines.append("/auto on 으로 자동매매를 시작하세요.")
+        return "\n".join(lines)
+
     def _cmd_strategy(self, _args: list[str]) -> str:
         return self.strategy.get_rules_summary()
 
@@ -116,29 +185,13 @@ class TelegramTradingBot:
         return self.strategy.get_news_briefing()
 
     def _cmd_status(self, _args: list[str]) -> str:
-        deposit = self.client.get_deposit()
-        fmt = self.client.format_amount
-        return (
-            "【계좌 상태】\n"
-            f"예수금: {fmt(deposit.get('entr', '0'))}원\n"
-            f"주문가능: {fmt(deposit.get('ord_alow_amt', '0'))}원\n"
-            f"출금가능: {fmt(deposit.get('pymn_alow_amt', '0'))}원"
-        )
+        return self.strategy.build_account_status()
 
     def _cmd_balance(self, _args: list[str]) -> str:
-        holdings = self.client.get_holdings()
-        if not holdings:
-            return "보유 종목이 없습니다."
+        return self.strategy.build_balance_detail()
 
-        lines = ["【보유 종목】"]
-        for item in holdings:
-            code = self.client.normalize_stock_code(item.get("stk_cd", ""))
-            name = item.get("stk_nm", code)
-            qty = item.get("rmnd_qty", "0")
-            price = item.get("cur_prc", "0")
-            profit = item.get("prft_rt", "0")
-            lines.append(f"- {name}({code}) {qty}주 @ {price} ({profit}%)")
-        return "\n".join(lines)
+    def _cmd_portfolio(self, _args: list[str]) -> str:
+        return self.strategy.build_account_dashboard()
 
     def _cmd_rank(self, _args: list[str]) -> str:
         items = self.client.get_trade_value_rank(top_n=5)
@@ -212,6 +265,7 @@ class TelegramTradingBot:
         action = args[0].lower()
         if action in ("on", "start", "1"):
             self.strategy.enable()
+            set_auto_trading_enabled(True)
             self._start_auto_loop()
             threading.Thread(
                 target=self._run_auto_cycle_silent_check,
@@ -219,12 +273,13 @@ class TelegramTradingBot:
             ).start()
             return (
                 f"자동매매 시작 ({effective_auto_interval_sec()}초 · "
-                f"{'스캘핑' if is_scalping_mode() else '스윙'})\n"
+                f"{mode_label()})\n"
                 "알림: 체결·매수·매도·실패 시에만 전송\n"
-                "전체 현황: /report"
+                "계좌·보유: /portfolio"
             )
         if action in ("off", "stop", "0"):
             self.strategy.disable()
+            set_auto_trading_enabled(False)
             self._stop_auto_loop()
             return "자동매매 중지"
         return "사용법: /auto on 또는 /auto off"
@@ -263,6 +318,15 @@ class TelegramTradingBot:
 
     def _stop_auto_loop(self) -> None:
         self._stop_auto.set()
+
+    def _restart_auto_loop(self) -> None:
+        """모드 변경 등으로 점검 주기가 바뀔 때 자동 루프 재시작."""
+        self._stop_auto_loop()
+        if self._auto_thread and self._auto_thread.is_alive():
+            self._auto_thread.join(timeout=5)
+        self._auto_thread = None
+        if self.strategy.enabled:
+            self._start_auto_loop()
 
     def handle_command(self, text: str) -> str | None:
         text = text.strip()
@@ -340,7 +404,11 @@ class TelegramTradingBot:
             )
         offset = self._skip_backlog()
         mode = "모의투자" if use_paper else "실전투자"
-        startup = f"키움 자동매매 봇 시작 ({mode})\n/help 로 명령어를 확인하세요."
+        strat = mode_label()
+        startup = (
+            f"키움 자동매매 봇 시작 ({mode} · {strat})\n"
+            "/help 로 명령어를 확인하세요."
+        )
         print(startup)
         self.notify(startup)
         print(f"채팅 {TARGET_CHAT_ID} 명령 대기 중... (종료: Ctrl+C)")

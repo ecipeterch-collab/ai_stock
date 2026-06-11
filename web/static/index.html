@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0f1419" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <title>AI Stock</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <div id="app">
+    <section id="login-view" class="panel login-panel hidden">
+      <h1>AI Stock</h1>
+      <p class="muted">계좌·보유 현황 (로그인 필요)</p>
+      <form id="login-form">
+        <label>
+          아이디
+          <input type="text" id="username" autocomplete="username" required />
+        </label>
+        <label>
+          비밀번호
+          <input type="password" id="password" autocomplete="current-password" required />
+        </label>
+        <p id="login-error" class="error hidden"></p>
+        <button type="submit" class="btn primary">로그인</button>
+      </form>
+    </section>
+
+    <section id="dashboard-view" class="hidden">
+      <header class="top-bar">
+        <div>
+          <h1>AI Stock</h1>
+          <p id="meta-line" class="muted">—</p>
+        </div>
+        <button type="button" id="logout-btn" class="btn ghost">로그아웃</button>
+      </header>
+
+      <div id="error-banner" class="banner error hidden"></div>
+
+      <div class="cards">
+        <article class="card">
+          <span class="label">예수금</span>
+          <strong id="cash-value">—</strong>
+        </article>
+        <article class="card">
+          <span class="label">주문가능</span>
+          <strong id="orderable-value">—</strong>
+        </article>
+        <article class="card">
+          <span class="label">보유 평가(근사)</span>
+          <strong id="portfolio-value">—</strong>
+        </article>
+        <article class="card accent">
+          <span class="label">자동매매</span>
+          <strong id="auto-value">—</strong>
+        </article>
+      </div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>보유 종목</h2>
+          <span id="holdings-count" class="badge">0</span>
+        </div>
+        <div id="holdings-empty" class="muted empty">보유 종목이 없습니다.</div>
+        <ul id="holdings-list" class="holdings-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>수익률</h2>
+        <div class="chart-wrap">
+          <canvas id="profit-chart" aria-label="종목별 수익률"></canvas>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>매수 상태</h2>
+        <p id="buy-status-line" class="status-line">—</p>
+        <ul id="block-reasons" class="reasons-list"></ul>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>거래 통계</h2>
+          <span id="stats-period" class="badge muted-badge">30일</span>
+        </div>
+        <p id="stats-summary" class="status-line">—</p>
+        <div class="stats-tables">
+          <div>
+            <h3 class="stats-subhead">진입 채널</h3>
+            <table class="stats-table" id="stats-entry-table">
+              <thead>
+                <tr>
+                  <th>구분</th>
+                  <th>건수</th>
+                  <th>승률</th>
+                  <th>평균</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div>
+            <h3 class="stats-subhead">청산 유형</h3>
+            <table class="stats-table" id="stats-exit-table">
+              <thead>
+                <tr>
+                  <th>구분</th>
+                  <th>건수</th>
+                  <th>승률</th>
+                  <th>평균</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <h3 class="stats-subhead">최근 완결 매도</h3>
+        <ul id="stats-recent-list" class="trades-list"></ul>
+      </section>
+
+      <section class="panel">
+        <h2>최근 거래</h2>
+        <ul id="trades-list" class="trades-list"></ul>
+      </section>
+
+      <footer class="footer">
+        <span id="updated-at">—</span>
+        <button type="button" id="refresh-btn" class="btn ghost small">새로고침</button>
+      </footer>
+    </section>
+  </div>
+</body>
+</html>

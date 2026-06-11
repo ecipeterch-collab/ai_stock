@@ -5,22 +5,22 @@ from __future__ import annotations
 from datetime import datetime
 
 from config.config import (
+    hard_stop_loss_pct,
     scalping_breakeven_activate_pct,
     scalping_breakeven_floor_pct,
+    scalping_emergency_stop_loss_multiple,
     scalping_max_flu_rt,
     scalping_max_hold_minutes,
     scalping_min_bullish_count,
     scalping_min_flu_rt,
     scalping_min_hold_minutes_for_quick_exit,
+    scalping_min_hold_seconds_for_stop_loss,
     scalping_min_rank_improve,
     scalping_min_score,
     scalping_momentum_stall_drop_pct,
     scalping_momentum_stall_min_peak_pct,
     scalping_optimal_flu_rt,
-    scalping_quick_profit_pct,
     scalping_scan_rank_top,
-    scalping_stop_loss_pct,
-    scalping_take_profit_pct,
     scalping_trailing_activate_pct,
     scalping_trailing_drawdown_pct,
 )
@@ -68,10 +68,11 @@ def filter_scalp_candidates(
             rejected.append(f"{cand.name}: 등락 {cand.flu_rt:.2f}% (과열)")
             continue
         if cand.rank_improve < scalping_min_rank_improve:
-            rejected.append(
-                f"{cand.name}: 순위급등 부족 ({cand.prev_rank}→{cand.rank})"
-            )
-            continue
+            if cand.rank > 5:
+                rejected.append(
+                    f"{cand.name}: 순위급등 부족 ({cand.prev_rank}→{cand.rank})"
+                )
+                continue
         if cand.rank > scalping_scan_rank_top:
             rejected.append(f"{cand.name}: 순위 {cand.rank}위 (유동성 밖)")
             continue
@@ -111,20 +112,23 @@ def evaluate_scalp_sell(
     if hold_min >= scalping_max_hold_minutes:
         return f"보유시간 초과 ({hold_min:.0f}분 ≥ {scalping_max_hold_minutes}분)", qty
 
-    if profit_pct <= -scalping_stop_loss_pct:
-        return f"스캘핑 손절 ({profit_pct:.2f}% ≤ -{scalping_stop_loss_pct}%)", qty
+    # 고정 손절: 스캘핑 전용 얕은 손절 대신, -5% 손실 시 청산
+    stop_loss = float(hard_stop_loss_pct)
 
-    if profit_pct >= scalping_take_profit_pct:
-        return f"스캘핑 익절 (+{profit_pct:.2f}% ≥ +{scalping_take_profit_pct}%)", qty
+    # 진입 직후 미세 노이즈로 손절이 나가지 않게 유예하되,
+    # 손실이 과도하게 커지면(응급 손절) 즉시 청산
+    min_hold_sec = max(0, int(scalping_min_hold_seconds_for_stop_loss))
+    if min_hold_sec > 0 and hold_min * 60.0 < min_hold_sec:
+        emergency = -stop_loss * float(scalping_emergency_stop_loss_multiple)
+        if profit_pct <= emergency:
+            return (f"응급 손절 ({profit_pct:.2f}% ≤ {emergency:.2f}%)", qty)
+        if profit_pct <= -stop_loss:
+            return None, 0
 
-    if (
-        hold_min >= scalping_min_hold_minutes_for_quick_exit
-        and profit_pct >= scalping_quick_profit_pct
-    ):
-        return (
-            f"스캘핑 빠른 익절 (+{profit_pct:.2f}% ≥ +{scalping_quick_profit_pct}%)",
-            qty,
-        )
+    if profit_pct <= -stop_loss:
+        return f"고정 손절 ({profit_pct:.2f}% ≤ -{stop_loss:.2f}%)", qty
+
+    # 수익실현(부분매도)은 strategy.py에서 공통 규칙(+10/+15/+20)에 따라 처리한다.
 
     if peak >= scalping_trailing_activate_pct:
         floor = peak - scalping_trailing_drawdown_pct

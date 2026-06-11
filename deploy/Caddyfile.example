@@ -1,0 +1,16 @@
+# Caddy 역프록시 예시
+# 1) 이 파일을 Caddyfile 로 복사: copy deploy\Caddyfile.example deploy\Caddyfile
+# 2) your-domain.example.com 을 실제 도메인으로 변경
+# 3) DNS A 레코드 → 집 공인 IP, 공유기 443 포워딩
+# 4) python run_web.py (127.0.0.1:8080) 실행 후 scripts\caddy-serve.ps1
+
+your-domain.example.com {
+	encode gzip
+	reverse_proxy 127.0.0.1:8080
+}
+
+# Tailscale MagicDNS 이름으로만 쓸 경우 (공인 Let's Encrypt 대신 내부 CA):
+# https://my-pc.my-tailnet.ts.net {
+# 	tls internal
+# 	reverse_proxy 127.0.0.1:8080
+# }

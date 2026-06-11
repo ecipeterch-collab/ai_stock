@@ -21,14 +21,27 @@ from config.config import (
     strategy_eod_cut_loss_time,
     strategy_eod_sell_time,
     strategy_max_positions,
-    strategy_mode,
     strategy_portfolio_heat_limit,
     strategy_portfolio_heat_pct,
 )
+from trading.mode_settings import get_strategy_mode, mode_label, set_strategy_mode
+
+__all__ = [
+    "effective_auto_interval_sec",
+    "effective_buy_windows",
+    "effective_eod_times",
+    "effective_max_buys_per_day",
+    "effective_max_positions",
+    "effective_portfolio_heat",
+    "get_strategy_mode",
+    "is_scalping_mode",
+    "mode_label",
+    "set_strategy_mode",
+]
 
 
 def is_scalping_mode() -> bool:
-    return str(strategy_mode).lower().strip() == "scalping"
+    return get_strategy_mode() == "scalping"
 
 
 def effective_auto_interval_sec() -> int:

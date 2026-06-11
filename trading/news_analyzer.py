@@ -11,8 +11,10 @@ from urllib.parse import quote
 import requests
 
 from config.config import (
+    news_block_buy_risk_floor,
     news_block_buy_risk_score,
     news_block_buy_sentiment,
+    news_block_buy_sentiment_hard,
     news_cache_minutes,
     news_defensive_sell_sentiment,
     news_enabled,
@@ -166,6 +168,20 @@ class MarketNewsContext:
         return "\n".join(lines)
 
 
+def _compute_allow_buy(sentiment: float, risk_score: float) -> bool:
+    """복합 뉴스 필터: 고위험·극단 부정·부정+리스크 동반 시에만 매수 차단.
+
+    부정 키워드만 많고 지정학 리스크가 낮은 날(심리만 나쁨)은 기술적 매매 허용.
+    """
+    if risk_score >= news_block_buy_risk_score:
+        return False
+    if sentiment < news_block_buy_sentiment_hard:
+        return False
+    if sentiment < news_block_buy_sentiment and risk_score >= news_block_buy_risk_floor:
+        return False
+    return True
+
+
 class MarketNewsAnalyzer:
     """경제·지정학 뉴스 RSS 기반 시장 심리 분석."""
 
@@ -296,10 +312,7 @@ class MarketNewsAnalyzer:
 
         ctx.headlines = [f"[{i.category}] {i.title}" for i in items[:news_max_headlines]]
 
-        ctx.allow_buy = (
-            ctx.sentiment >= news_block_buy_sentiment
-            and ctx.risk_score < news_block_buy_risk_score
-        )
+        ctx.allow_buy = _compute_allow_buy(ctx.sentiment, ctx.risk_score)
         ctx.defensive_mode = (
             ctx.sentiment <= news_defensive_sell_sentiment
             or ctx.risk_score >= news_force_reduce_risk_score
