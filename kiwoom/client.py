@@ -16,11 +16,19 @@ from config.config import (
     real_app_secret,
     real_host_url,
     use_paper,
+    dmst_stex_tp,
+    kiwoom_chart_exchange,
+    kiwoom_execution_stex_tp,
+    kiwoom_paper_min_request_interval_sec,
+    kiwoom_rank_stex_tp,
+    kiwoom_real_min_request_interval_sec,
 )
 
 TOKEN_ENDPOINT = "/oauth2/token"
+TOKEN_REVOKE_ENDPOINT = "/oauth2/revoke"
 ACNT_ENDPOINT = "/api/dostk/acnt"
 RANK_ENDPOINT = "/api/dostk/rkinfo"
+CHART_ENDPOINT = "/api/dostk/chart"
 ORDER_ENDPOINT = "/api/dostk/ordr"
 
 
@@ -28,8 +36,23 @@ class KiwoomAPIError(RuntimeError):
     pass
 
 
+_clients: dict[bool, "KiwoomClient"] = {}
+_clients_lock = threading.Lock()
+
+
+def get_shared_client(paper: bool | None = None) -> "KiwoomClient":
+    """프로세스당 모의/실전 각 1개 클라이언트 (토큰·호출 제한 공유)."""
+    key = use_paper if paper is None else paper
+    with _clients_lock:
+        client = _clients.get(key)
+        if client is None:
+            client = KiwoomClient(paper=key)
+            _clients[key] = client
+        return client
+
+
 class KiwoomClient:
-    """키움 REST API 클라이언트 (모의/실전 전환 지원)."""
+    """키움 REST API 클라이언트 (모의/실전, KRX·NXT·SOR·통합 시세)."""
 
     def __init__(self, paper: bool | None = None) -> None:
         self.paper = use_paper if paper is None else paper
@@ -37,14 +60,27 @@ class KiwoomClient:
             self.host = paper_host_url
             self.app_key = paper_app_key
             self.app_secret = paper_app_secret
+            self._min_request_interval_sec = float(kiwoom_paper_min_request_interval_sec)
         else:
             self.host = real_host_url
             self.app_key = real_app_key
             self.app_secret = real_app_secret
+            self._min_request_interval_sec = float(kiwoom_real_min_request_interval_sec)
 
         self._token: str | None = None
         self._token_expires_at: datetime | None = None
         self._lock = threading.Lock()
+        self._last_request_at: float = 0.0
+
+    def close(self) -> None:
+        """접근토큰 폐기(au10002) — 세션 종료 시 호출 권장."""
+        self.revoke_token()
+
+    def __enter__(self) -> KiwoomClient:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
 
     def _issue_token(self) -> str:
         last_error: Exception | None = None
@@ -84,10 +120,45 @@ class KiwoomClient:
             raise last_error
         raise KiwoomAPIError("토큰 발급에 실패했습니다.")
 
+    def revoke_token(self) -> None:
+        """접근토큰 폐기(au10002). 토큰 발급 한도 절약."""
+        token = self._token
+        if not token:
+            return
+        with self._lock:
+            self._throttle()
+            try:
+                response = requests.post(
+                    self.host + TOKEN_REVOKE_ENDPOINT,
+                    headers={
+                        "Content-Type": "application/json;charset=UTF-8",
+                        "api-id": "au10002",
+                    },
+                    json={
+                        "appkey": self.app_key,
+                        "secretkey": self.app_secret,
+                        "token": token,
+                    },
+                    timeout=15,
+                )
+                if response.status_code == 429:
+                    return
+                response.raise_for_status()
+            except requests.RequestException:
+                return
+            finally:
+                self._token = None
+                self._token_expires_at = None
+
     def _ensure_token(self) -> str:
         if self._token and self._token_expires_at and datetime.now() < self._token_expires_at:
             return self._token
         return self._issue_token()
+
+    def _throttle(self) -> None:
+        elapsed = time.monotonic() - self._last_request_at
+        if elapsed < self._min_request_interval_sec:
+            time.sleep(self._min_request_interval_sec - elapsed)
 
     def post(
         self,
@@ -99,22 +170,10 @@ class KiwoomClient:
         next_key: str = "",
     ) -> tuple[dict, dict]:
         with self._lock:
+            self._throttle()
             token = self._ensure_token()
-            response = requests.post(
-                self.host + endpoint,
-                headers={
-                    "Content-Type": "application/json;charset=UTF-8",
-                    "authorization": f"Bearer {token}",
-                    "cont-yn": cont_yn,
-                    "next-key": next_key,
-                    "api-id": api_id,
-                },
-                json=data or {},
-                timeout=30,
-            )
-            if response.status_code == 429:
-                time.sleep(1)
-                token = self._issue_token()
+            last_exc: Exception | None = None
+            for attempt in range(5):
                 response = requests.post(
                     self.host + endpoint,
                     headers={
@@ -127,6 +186,22 @@ class KiwoomClient:
                     json=data or {},
                     timeout=30,
                 )
+                if response.status_code == 429:
+                    wait = min(2 ** attempt, 8)
+                    last_exc = requests.HTTPError(
+                        f"{api_id} 호출 제한(429), {wait}초 후 재시도",
+                        response=response,
+                    )
+                    time.sleep(wait)
+                    if attempt >= 2:
+                        token = self._issue_token()
+                    continue
+                break
+            else:
+                if last_exc:
+                    raise last_exc
+                raise KiwoomAPIError(f"{api_id} 호출 제한(429)")
+            self._last_request_at = time.monotonic()
             response.raise_for_status()
             body = response.json()
             headers = {
@@ -171,12 +246,31 @@ class KiwoomClient:
 
     @staticmethod
     def normalize_stock_code(stk_cd: str) -> str:
-        """API 응답 종목코드 → 주문/조회용 6자리 코드 (예: A005930 → 005930, A0193W0 → 0193W0)."""
+        """API 응답 종목코드 → 주문/조회용 6자리 코드 (예: A005930 → 005930, 039490_AL → 039490)."""
         code = stk_cd.split("_")[0].strip().upper()
         if len(code) == 7 and code[0] == "A":
             body = code[1:]
             if len(body) == 6 and body.isalnum():
                 return body
+        base = code
+        for suffix in ("_AL", "_NX"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        return base
+
+    @staticmethod
+    def format_stock_code_for_exchange(
+        stk_cd: str,
+        exchange: str | None = None,
+    ) -> str:
+        """차트·시세 조회용 거래소별 종목코드 (KRX 6자리 / NXT _NX / 통합 _AL)."""
+        code = KiwoomClient.normalize_stock_code(stk_cd)
+        ex = (exchange or kiwoom_chart_exchange or "KRX").upper()
+        if ex in ("SOR", "AL", "통합", "3", "ALL"):
+            return f"{code}_AL"
+        if ex in ("NXT", "2"):
+            return f"{code}_NX"
         return code
 
     @staticmethod
@@ -194,7 +288,9 @@ class KiwoomClient:
 
     @staticmethod
     def parse_qty(value: str) -> int:
-        cleaned = value.strip().lstrip("0") or "0"
+        cleaned = value.strip().replace(",", "")
+        if not cleaned:
+            return 0
         try:
             return int(cleaned)
         except ValueError:
@@ -218,7 +314,7 @@ class KiwoomClient:
         params = {
             "mrkt_tp": market,
             "mang_stk_incls": "1",
-            "stex_tp": "3",
+            "stex_tp": kiwoom_rank_stex_tp,
         }
         body, headers = self.post(RANK_ENDPOINT, "ka10032", params)
         items = list(body.get("trde_prica_upper", []))
@@ -247,15 +343,16 @@ class KiwoomClient:
         ord_no: str = "",
         qry_tp: str = "0",
         sell_tp: str = "0",
-        stex_tp: str = "1",
+        stex_tp: str | None = None,
     ) -> list[dict]:
-        """체결 내역 조회 (ka10076)."""
+        """체결 내역 조회 (ka10076). stex_tp: 0=통합, 1=KRX, 2=NXT."""
+        resolved_stex = stex_tp if stex_tp is not None else kiwoom_execution_stex_tp
         params = {
             "stk_cd": self.normalize_stock_code(stk_cd) if stk_cd else "",
             "qry_tp": qry_tp,
             "sell_tp": sell_tp,
             "ord_no": ord_no,
-            "stex_tp": stex_tp,
+            "stex_tp": resolved_stex,
         }
         body, headers = self.post(ACNT_ENDPOINT, "ka10076", params)
         items = list(body.get("cntr", []))
@@ -272,9 +369,57 @@ class KiwoomClient:
 
         return items
 
-    def get_holdings(self) -> list[dict]:
-        """계좌 평가 잔고 (kt00018)."""
-        params = {"qry_tp": "1", "dmst_stex_tp": "KRX"}
+    def get_daily_chart(
+        self,
+        stk_cd: str,
+        *,
+        base_dt: str | None = None,
+        upd_stkpc_tp: str = "1",
+        exchange: str | None = None,
+    ) -> list[dict]:
+        """일봉 차트 (ka10081). 첫 페이지만 (약 600봉)."""
+        code = self.format_stock_code_for_exchange(stk_cd, exchange)
+        dt = base_dt or datetime.now().strftime("%Y%m%d")
+        body, _ = self.post(
+            CHART_ENDPOINT,
+            "ka10081",
+            {"stk_cd": code, "base_dt": dt, "upd_stkpc_tp": upd_stkpc_tp},
+        )
+        return list(body.get("stk_dt_pole_chart_qry", []))
+
+    def get_minute_chart(
+        self,
+        stk_cd: str,
+        *,
+        tic_scope: str = "5",
+        base_dt: str | None = None,
+        upd_stkpc_tp: str = "1",
+        exchange: str | None = None,
+    ) -> list[dict]:
+        """분봉 차트 (ka10080). 첫 페이지만 (약 900봉). tic_scope: 1/3/5/10/15/30/45/60."""
+        code = self.format_stock_code_for_exchange(stk_cd, exchange)
+        payload: dict[str, str] = {
+            "stk_cd": code,
+            "tic_scope": tic_scope,
+            "upd_stkpc_tp": upd_stkpc_tp,
+        }
+        if base_dt:
+            payload["base_dt"] = base_dt
+        body, _ = self.post(
+            CHART_ENDPOINT,
+            "ka10080",
+            payload,
+        )
+        return list(body.get("stk_min_pole_chart_qry", []))
+
+    def get_holdings(
+        self,
+        *,
+        dmst_stex: str | None = None,
+    ) -> list[dict]:
+        """계좌 평가 잔고 (kt00018). dmst_stex: KRX | NXT (모의는 KRX만)."""
+        resolved = dmst_stex or (dmst_stex_tp if not self.paper else "KRX")
+        params = {"qry_tp": "1", "dmst_stex_tp": resolved}
         body, headers = self.post(ACNT_ENDPOINT, "kt00018", params)
         items = list(body.get("acnt_evlt_remn_indv_tot", []))
 
@@ -290,13 +435,26 @@ class KiwoomClient:
 
         return items
 
-    def buy_market(self, stk_cd: str, qty: int, dmst_stex_tp: str = "KRX") -> dict:
-        """시장가 매수 (kt10000)."""
+    def _resolve_dmst_stex(self, exchange: str | None = None) -> str:
+        """주문 거래소. 모의투자는 KRX만, 실전은 config dmst_stex_tp (KRX|NXT|SOR)."""
+        if exchange:
+            return exchange
+        if self.paper:
+            return "KRX"
+        return dmst_stex_tp
+
+    def buy_market(
+        self,
+        stk_cd: str,
+        qty: int,
+        dmst_stex_tp: str | None = None,
+    ) -> dict:
+        """시장가 매수 (kt10000). dmst_stex_tp: KRX | NXT | SOR."""
         body, _ = self.post(
             ORDER_ENDPOINT,
             "kt10000",
             {
-                "dmst_stex_tp": dmst_stex_tp,
+                "dmst_stex_tp": self._resolve_dmst_stex(dmst_stex_tp),
                 "stk_cd": self.normalize_stock_code(stk_cd),
                 "ord_qty": str(qty),
                 "ord_uv": "",
@@ -306,13 +464,18 @@ class KiwoomClient:
         )
         return body
 
-    def sell_market(self, stk_cd: str, qty: int, dmst_stex_tp: str = "KRX") -> dict:
+    def sell_market(
+        self,
+        stk_cd: str,
+        qty: int,
+        dmst_stex_tp: str | None = None,
+    ) -> dict:
         """시장가 매도 (kt10001)."""
         body, _ = self.post(
             ORDER_ENDPOINT,
             "kt10001",
             {
-                "dmst_stex_tp": dmst_stex_tp,
+                "dmst_stex_tp": self._resolve_dmst_stex(dmst_stex_tp),
                 "stk_cd": self.normalize_stock_code(stk_cd),
                 "ord_qty": str(qty),
                 "ord_uv": "",
@@ -327,14 +490,14 @@ class KiwoomClient:
         stk_cd: str,
         qty: int,
         price: int,
-        dmst_stex_tp: str = "KRX",
+        dmst_stex_tp: str | None = None,
     ) -> dict:
         """지정가 매수 (kt10000)."""
         body, _ = self.post(
             ORDER_ENDPOINT,
             "kt10000",
             {
-                "dmst_stex_tp": dmst_stex_tp,
+                "dmst_stex_tp": self._resolve_dmst_stex(dmst_stex_tp),
                 "stk_cd": self.normalize_stock_code(stk_cd),
                 "ord_qty": str(qty),
                 "ord_uv": str(price),
@@ -349,14 +512,14 @@ class KiwoomClient:
         stk_cd: str,
         qty: int,
         price: int,
-        dmst_stex_tp: str = "KRX",
+        dmst_stex_tp: str | None = None,
     ) -> dict:
         """지정가 매도 (kt10001)."""
         body, _ = self.post(
             ORDER_ENDPOINT,
             "kt10001",
             {
-                "dmst_stex_tp": dmst_stex_tp,
+                "dmst_stex_tp": self._resolve_dmst_stex(dmst_stex_tp),
                 "stk_cd": self.normalize_stock_code(stk_cd),
                 "ord_qty": str(qty),
                 "ord_uv": str(price),

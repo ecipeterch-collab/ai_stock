@@ -68,6 +68,13 @@ config/            # 설정 (config.py는 Git 제외)
 data/              # 포지션 추적 JSON
 ```
 
+## 키움 REST API (2026-06 개선)
+
+- **NXT·SOR·통합 시세**: `config.py` 의 `dmst_stex_tp`, `kiwoom_rank_stex_tp`, `kiwoom_chart_exchange` 참고
+- **호출 제한**: 모의 초당 1회 / 실전 초당 5회 (`kiwoom_*_min_request_interval_sec`)
+- **토큰 폐기**: 봇 종료 시 `au10002` 자동 호출 (`KiwoomClient.revoke_token()`)
+- 모의투자는 **KRX만** 지원 (공식 가이드)
+
 ## 보안
 
 `config/local_secrets.py`, `.env*`, `*_appkey.txt`, `*_secretkey.txt` 는 Git에 포함되지 않습니다. GitHub에 올리기 전에 저장소가 **private** 인지 확인하세요.

@@ -34,6 +34,13 @@ web_secret_key = "32자이상_임의문자열"
 python run_web.py
 ```
 
+`web_tunnel_enabled = True`(기본)이면 **cloudflared**로 외부 HTTPS URL이 자동 출력됩니다.
+(재시작마다 `trycloudflare.com` 주소 변경 — ai_coin과 별도 터널)
+
+설치: `winget install Cloudflare.cloudflared`
+
+터널 끄기: `config/config.py` → `web_tunnel_enabled = False` 후 Tailscale/Caddy 사용
+
 ---
 
 ## A. Tailscale Serve (권장)
@@ -146,6 +153,8 @@ Windows 방화벽에서 **TCP 443** 인바운드 허용 (Caddy).
 4. (선택) Caddy: `.\scripts\caddy-serve.ps1` → `https://yourdomain.com`
 
 둘 다 같은 `127.0.0.1:8080` 을 바라봅니다.
+
+**ai_coin(코인봇)과 함께 쓸 때** → [MULTI_APP.md](MULTI_APP.md) 참고 (포트 8081 분리 또는 Caddy 게이트웨이).
 
 ---
 

@@ -8,6 +8,7 @@
   <title>AI Stock</title>
   <link rel="stylesheet" href="/static/styles.css" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js" defer></script>
+  <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js" defer></script>
   <script src="/static/app.js" defer></script>
 </head>
 <body>
@@ -39,6 +40,46 @@
       </header>
 
       <div id="error-banner" class="banner error hidden"></div>
+
+      <section class="panel account-panel">
+        <div class="panel-head">
+          <h2>원금 대비 손익</h2>
+          <span id="account-mode-badge" class="badge muted-badge">—</span>
+        </div>
+        <div class="account-hero">
+          <div>
+            <span class="label">총자산</span>
+            <strong id="acct-total-value" class="hero-value">—</strong>
+          </div>
+          <div class="hero-delta">
+            <span class="label">원금 대비</span>
+            <strong id="acct-delta-value">—</strong>
+            <span id="acct-delta-pct" class="muted">—</span>
+          </div>
+        </div>
+        <div class="cards account-cards">
+          <article class="card">
+            <span class="label">시작 원금</span>
+            <strong id="acct-initial-value">—</strong>
+          </article>
+          <article class="card">
+            <span class="label">거래 순손익</span>
+            <strong id="acct-trading-net">—</strong>
+          </article>
+          <article class="card">
+            <span class="label">완결 승률</span>
+            <strong id="acct-win-rate">—</strong>
+          </article>
+          <article class="card">
+            <span class="label">수수료·세금</span>
+            <strong id="acct-fees-value">—</strong>
+          </article>
+        </div>
+        <p id="account-trading-line" class="status-line muted">—</p>
+        <div class="chart-wrap chart-wrap-tall">
+          <canvas id="monthly-pnl-chart" aria-label="월별 순손익"></canvas>
+        </div>
+      </section>
 
       <div class="cards">
         <article class="card">
@@ -73,6 +114,21 @@
         <div class="chart-wrap">
           <canvas id="profit-chart" aria-label="종목별 수익률"></canvas>
         </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <h2>매매 종목 차트</h2>
+          <span id="trade-chart-count" class="badge muted-badge">0</span>
+        </div>
+        <p id="trade-chart-hint" class="muted">최근 매매 종목 일봉 · 매수/매도 표시</p>
+        <div id="trade-stock-tabs" class="stock-tabs"></div>
+        <div id="trade-chart-empty" class="muted empty hidden">매매 기록 없음</div>
+        <div id="trade-chart-loading" class="muted empty hidden">차트 불러오는 중…</div>
+        <div id="trade-chart-wrap" class="stock-chart-wrap hidden">
+          <div id="stock-candle-chart" aria-label="종목 일봉"></div>
+        </div>
+        <ul id="trade-chart-trades" class="trades-list compact-trades"></ul>
       </section>
 
       <section class="panel">
@@ -126,9 +182,29 @@
         <ul id="trades-list" class="trades-list"></ul>
       </section>
 
+      <section class="panel" id="commands-panel">
+        <div class="panel-head">
+          <h2>명령 · Help</h2>
+          <span class="badge muted-badge">텔레그램 동일</span>
+        </div>
+        <p class="muted cmd-hint">버튼 실행 후 결과가 아래에 표시됩니다. 매수·매도는 인자 입력이 필요합니다.</p>
+        <div id="command-groups" class="command-groups"></div>
+        <div id="command-args-box" class="command-args hidden">
+          <label id="command-args-label" for="command-arg-input">인자</label>
+          <div class="command-args-row">
+            <input type="text" id="command-arg-input" autocomplete="off" />
+            <button type="button" id="command-args-run" class="btn primary small">실행</button>
+            <button type="button" id="command-args-cancel" class="btn ghost small">취소</button>
+          </div>
+        </div>
+        <pre id="command-result" class="command-result hidden" aria-live="polite"></pre>
+      </section>
+
       <footer class="footer">
         <span id="updated-at">—</span>
-        <button type="button" id="refresh-btn" class="btn ghost small">새로고침</button>
+        <span id="chart-updated-at" class="muted chart-updated">—</span>
+        <a id="external-url" class="external-link hidden" href="#" target="_blank" rel="noopener">외부 접속</a>
+        <button type="button" id="refresh-btn" class="btn ghost small">전체 새로고침</button>
       </footer>
     </section>
   </div>

@@ -5,15 +5,26 @@ from datetime import datetime
 import requests
 
 from config.config import use_paper
-from kiwoom.client import KiwoomAPIError, KiwoomClient
+from kiwoom.client import KiwoomAPIError, get_shared_client
 from trading.market_utils import market_status_text
-from trading.journal_stats import build_journal_stats
-from trading.mode_settings import get_auto_trading_enabled, get_strategy_mode, mode_label
+from trading.account_pnl import build_account_summary
+from trading.journal_stats import build_daily_summary, build_journal_stats
+from trading.mode_settings import get_strategy_mode, mode_label
 from trading.runtime_config import effective_max_buys_per_day, effective_max_positions
 from trading.strategy import AutoTradingStrategy
 
 
-def _deposit_numbers(client: KiwoomClient, deposit: dict) -> dict:
+def _resolve_strategy() -> AutoTradingStrategy:
+    """웹·봇이 동일 Kiwoom 클라이언트·전략 상태를 공유."""
+    try:
+        from web.commands import _get_bot
+
+        return _get_bot().strategy
+    except Exception:
+        return AutoTradingStrategy(get_shared_client())
+
+
+def _deposit_numbers(client, deposit: dict) -> dict:
     fmt = client.format_amount
     return {
         "cash": int(client.parse_price(deposit.get("entr", "0"))),
@@ -27,15 +38,12 @@ def _deposit_numbers(client: KiwoomClient, deposit: dict) -> dict:
 
 def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dict:
     """웹 대시보드용 JSON 스냅샷."""
-    strat = strategy or AutoTradingStrategy(KiwoomClient())
+    strat = strategy or _resolve_strategy()
     client = strat.client
     strat._reset_daily_counter()
 
-    auto_saved = get_auto_trading_enabled()
-    if auto_saved is not None:
-        auto_on = auto_saved
-    else:
-        auto_on = strat.enabled
+    # 저장 설정과 달리 strategy.enabled·루프는 프로세스 재시작 시 초기화됨 → 실제 상태 우선
+    auto_on = strat.enabled
 
     snapshot: dict = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),
@@ -57,6 +65,8 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
         "buy_status": {},
         "recent_trades": [],
         "journal_stats": None,
+        "daily_summary": None,
+        "account_summary": None,
     }
 
     try:
@@ -129,5 +139,34 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
         snapshot["journal_stats"] = build_journal_stats(days=30)
     except OSError:
         snapshot["journal_stats"] = None
+
+    try:
+        snapshot["daily_summary"] = build_daily_summary()
+    except OSError:
+        snapshot["daily_summary"] = None
+
+    try:
+        acct = build_account_summary(include_live_balance=False)
+        cash = int((snapshot.get("deposit") or {}).get("cash") or 0)
+        holdings_eval = int(snapshot.get("portfolio_value") or 0)
+        if cash or holdings_eval:
+            initial = int(acct.get("initial_capital_krw") or 0)
+            total_assets = cash + holdings_eval
+            acct_summary = dict(acct.get("account_summary") or {})
+            acct_summary["total_assets_krw"] = total_assets
+            if initial > 0:
+                acct_summary["balance_delta_krw"] = total_assets - initial
+                acct_summary["return_on_capital_pct"] = round(
+                    (total_assets - initial) / initial * 100, 4
+                )
+            acct["account_summary"] = acct_summary
+            acct["live_totals"] = {
+                "cash_krw": cash,
+                "holdings_eval_krw": holdings_eval,
+                "total_assets_krw": total_assets,
+            }
+        snapshot["account_summary"] = acct
+    except OSError:
+        snapshot["account_summary"] = None
 
     return snapshot

@@ -28,7 +28,7 @@ Caddy가 설치되어 있지 않습니다.
     exit 1
 }
 
-$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8080 }
+$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8081 }
 Write-Host "Caddy 시작 (설정: $Caddyfile, 백엔드 127.0.0.1:$Port)" -ForegroundColor Cyan
 Write-Host "웹 서버: python run_web.py 가 먼저 실행 중이어야 합니다.`n" -ForegroundColor Yellow
 

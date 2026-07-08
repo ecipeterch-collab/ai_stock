@@ -43,6 +43,20 @@ def is_buy_window(
     )
 
 
+def calc_profit_pct(entry_price: int, exit_price: int) -> float | None:
+    """매수·매도가 기준 수익률(%)."""
+    if entry_price <= 0 or exit_price <= 0:
+        return None
+    return round((exit_price - entry_price) / entry_price * 100.0, 4)
+
+
+def calc_pnl_krw(entry_price: int, exit_price: int, qty: int) -> int | None:
+    """매수·매도가·수량 기준 손익(원, 세전·수수료 미포함)."""
+    if entry_price <= 0 or exit_price <= 0 or qty <= 0:
+        return None
+    return (exit_price - entry_price) * qty
+
+
 def market_status_text(now: datetime | None = None) -> str:
     current = now or datetime.now()
     if not is_weekday(current):

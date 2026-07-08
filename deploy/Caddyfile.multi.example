@@ -1,0 +1,34 @@
+# 코인(8082) + 주식(8081) 통합 게이트웨이 — Caddy :8080
+#
+# 1) ai_coin .env: WEB_PORT=8082, WEB_HOST=127.0.0.1, TUNNEL_ENABLED=false
+# 2) ai_stock config: web_port=8081, web_host=127.0.0.1
+# 3) python main.py web  (ai_coin)
+# 4) python run_web.py   (ai_stock)
+# 5) caddy run --config deploy/Caddyfile.multi  (또는 scripts\gateway-serve.ps1)
+# 6) cloudflared tunnel --url http://127.0.0.1:8080
+
+:8080 {
+	encode gzip
+
+	# --- AI Stock API ---
+	@stock_api path /api/dashboard* /api/journal* /api/account* /api/auth* /api/health
+	handle @stock_api {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# 주식 정적 파일 (코인은 /static 미사용)
+	handle /static/* {
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# 주식 UI — https://터널/stock
+	handle /stock/* {
+		uri strip_prefix /stock
+		reverse_proxy 127.0.0.1:8081
+	}
+
+	# --- AI Coin (나머지 전부) ---
+	handle {
+		reverse_proxy 127.0.0.1:8082
+	}
+}

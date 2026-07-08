@@ -16,10 +16,11 @@ from config.config import (
     telegram_token,
     use_paper,
 )
-from kiwoom.client import KiwoomAPIError, KiwoomClient
+from kiwoom.client import KiwoomAPIError, KiwoomClient, get_shared_client
 from telegram.tel_send import send_message
 from trading.mode_settings import (
     SETTINGS_FILE,
+    get_auto_trading_enabled,
     set_auto_trading_enabled,
     set_strategy_mode,
 )
@@ -54,15 +55,50 @@ class TelegramTradingBot:
     """텔레그램 명령으로 키움 API 매매를 제어하는 봇."""
 
     def __init__(self) -> None:
-        self.client = KiwoomClient()
+        self.client = get_shared_client()
         self.strategy = AutoTradingStrategy(self.client)
         self._auto_thread: threading.Thread | None = None
         self._stop_auto = threading.Event()
         if not SETTINGS_FILE.exists():
             set_strategy_mode(config_strategy_mode)
+        self.restore_auto_trading_from_settings()
+
+    def restore_auto_trading_from_settings(self) -> bool:
+        """runtime_settings 의 auto_trading_enabled=True 이면 재기동 후에도 루프 복원."""
+        if not get_auto_trading_enabled():
+            return False
+        self.strategy.enable()
+        self._start_auto_loop()
+        threading.Thread(
+            target=self._run_auto_cycle_silent_check,
+            daemon=True,
+        ).start()
+        return True
 
     def notify(self, text: str) -> None:
-        send_message(text)
+        try:
+            send_message(text)
+        except requests.RequestException:
+            pass
+
+    def _notify_cycle_events(self, result) -> None:
+        messages = (
+            result.events
+            if notify_on_auto_events_only
+            else result.messages
+        )
+        for message in messages:
+            self.notify(message)
+
+    def _run_auto_cycle_silent_check(self) -> None:
+        """주기 점검: 이벤트(체결·주문·실패)만 텔레그램 전송."""
+        try:
+            result = self.strategy.run_cycle()
+            self._notify_cycle_events(result)
+        except (KiwoomAPIError, requests.RequestException) as exc:
+            self.notify(f"자동매매 통신 오류: {exc}")
+        except Exception as exc:
+            self.notify(f"자동매매 점검 오류: {exc}")
 
     def _commands(self) -> dict[str, Callable[[list[str]], str]]:
         return {
@@ -91,6 +127,11 @@ class TelegramTradingBot:
             "/뉴스": self._cmd_news,
             "/report": self._cmd_report,
             "/리포트": self._cmd_report,
+            "/pnl": self._cmd_pnl,
+            "/손익": self._cmd_pnl,
+            "/account": self._cmd_account,
+            "/원금": self._cmd_account,
+            "/capital": self._cmd_capital,
             "/trend": self._cmd_trend,
             "/트렌드": self._cmd_trend,
             "/trendbuy": self._cmd_trend_buy,
@@ -117,6 +158,9 @@ class TelegramTradingBot:
             "/sell 종목코드 [수량] - 시장가 매도\n"
             f"/auto on|off - 자동매매 ({interval}초 주기, 이벤트만 알림)\n"
             "/report - 뉴스·잔고·점검 수동 리포트\n"
+            "/pnl [YYYY-MM-DD] - 매매·손익 요약 (기본: 오늘)\n"
+            "/account - 원금 대비 실계좌 손익 (수수료·세금 포함)\n"
+            "/capital 금액 - 시작 원금 설정 (예: /capital 500000000)\n"
             "/trend - 글로벌 트렌드·저가 후보 소개\n"
             "/trendbuy - 트렌드 1위 종목 매수\n"
             "/resetbuys - 일일 매수 제한 리셋\n"
@@ -144,6 +188,38 @@ class TelegramTradingBot:
 
     def _cmd_report(self, _args: list[str]) -> str:
         return self.strategy.build_manual_report()
+
+    def _cmd_pnl(self, args: list[str]) -> str:
+        from datetime import date as date_cls
+
+        target: date_cls | None = None
+        if args:
+            try:
+                target = date_cls.fromisoformat(args[0])
+            except ValueError:
+                return "사용법: /pnl 또는 /pnl 2026-06-17"
+        return self.strategy.get_daily_pnl_summary(target_date=target)
+
+    def _cmd_account(self, _args: list[str]) -> str:
+        return self.strategy.get_account_summary()
+
+    def _cmd_capital(self, args: list[str]) -> str:
+        from trading.account_settings import get_initial_capital, set_initial_capital
+
+        if not args:
+            current = get_initial_capital()
+            return (
+                f"【시작 원금】 {current:,}원\n"
+                "변경: /capital 500000000"
+            )
+        try:
+            value = int(args[0].replace(",", "").replace("_", ""))
+        except ValueError:
+            return "사용법: /capital 500000000"
+        if value <= 0:
+            return "원금은 0보다 커야 합니다."
+        set_initial_capital(value)
+        return f"시작 원금을 {value:,}원으로 설정했습니다.\n/account 로 손익을 확인하세요."
 
     def _cmd_mode(self, args: list[str]) -> str:
         if not args:
@@ -284,23 +360,6 @@ class TelegramTradingBot:
             return "자동매매 중지"
         return "사용법: /auto on 또는 /auto off"
 
-    def _notify_cycle_events(self, result) -> None:
-        messages = (
-            result.events
-            if notify_on_auto_events_only
-            else result.messages
-        )
-        for message in messages:
-            self.notify(message)
-
-    def _run_auto_cycle_silent_check(self) -> None:
-        """주기 점검: 이벤트(체결·주문·실패)만 텔레그램 전송."""
-        try:
-            result = self.strategy.run_cycle()
-            self._notify_cycle_events(result)
-        except requests.RequestException as exc:
-            self.notify(f"자동매매 통신 오류: {exc}")
-
     def _start_auto_loop(self) -> None:
         if self._auto_thread and self._auto_thread.is_alive():
             return
@@ -422,6 +481,7 @@ class TelegramTradingBot:
             except KeyboardInterrupt:
                 self.strategy.disable()
                 self._stop_auto_loop()
+                self.client.revoke_token()
                 self.notify("자동매매 봇을 종료합니다.")
                 print("\n종료합니다.")
                 break

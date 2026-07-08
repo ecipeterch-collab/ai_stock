@@ -220,6 +220,154 @@ input {
   color: var(--muted);
 }
 
+.chart-wrap-tall {
+  height: 180px;
+  margin-top: 12px;
+}
+
+.account-panel .label {
+  display: block;
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.account-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.hero-value {
+  font-size: 1.35rem;
+  display: block;
+}
+
+.hero-delta strong {
+  font-size: 1.1rem;
+}
+
+.account-cards {
+  margin-bottom: 8px;
+}
+
+.stock-tabs {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding-bottom: 8px;
+  margin-bottom: 8px;
+  -webkit-overflow-scrolling: touch;
+}
+
+.stock-tab {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 0.78rem;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.stock-tab.active {
+  border-color: var(--accent);
+  background: rgba(61, 139, 253, 0.15);
+}
+
+.stock-tab .tab-code {
+  display: block;
+  font-size: 0.68rem;
+  color: var(--muted);
+  margin-top: 2px;
+}
+
+.stock-chart-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-bottom: 8px;
+}
+
+#stock-candle-chart {
+  width: 100%;
+  height: 280px;
+}
+
+.compact-trades li {
+  font-size: 0.78rem;
+}
+
+.command-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.command-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.command-btn {
+  flex: 0 1 auto;
+}
+
+.cmd-hint {
+  margin: 0 0 12px;
+  font-size: 0.82rem;
+}
+
+.command-args {
+  margin: 12px 0;
+  padding: 12px;
+  background: var(--surface2);
+  border-radius: 8px;
+}
+
+.command-args-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.command-args-row input {
+  flex: 1;
+  padding: 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.command-result {
+  margin: 12px 0 0;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 0.78rem;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow: auto;
+}
+
+.command-result.command-error {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+.chart-updated {
+  font-size: 0.75rem;
+}
+
 .chart-wrap {
   position: relative;
   height: 220px;
@@ -311,9 +459,21 @@ input {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
   color: var(--muted);
   font-size: 0.8rem;
   padding: 8px 0 24px;
+}
+
+.external-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 0.8rem;
+}
+
+.external-link:hover {
+  text-decoration: underline;
 }
 
 .empty {

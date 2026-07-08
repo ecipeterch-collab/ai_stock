@@ -1,5 +1,5 @@
 # Tailscale Serve 중지
-$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8080 }
+$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8081 }
 
 if (-not (Get-Command tailscale -ErrorAction SilentlyContinue)) {
     Write-Host "tailscale 명령을 찾을 수 없습니다." -ForegroundColor Red

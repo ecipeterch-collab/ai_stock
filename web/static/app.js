@@ -1,8 +1,14 @@
 const TOKEN_KEY = "ai_stock_token";
-const REFRESH_MS = 10000;
+const CHART_REFRESH_MS = 10000;
 
 let profitChart = null;
-let refreshTimer = null;
+let monthlyPnlChart = null;
+let stockChart = null;
+let stockChartSeries = null;
+let selectedTradeCode = null;
+let tradedStocksCache = [];
+let chartRefreshTimer = null;
+let pendingCommand = null;
 
 const $ = (id) => document.getElementById(id);
 
@@ -39,6 +45,13 @@ async function api(path, options = {}) {
 
 function formatWon(n) {
   if (n == null) return "—";
+  const v = Number(n);
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toLocaleString("ko-KR")}원`;
+}
+
+function formatWonPlain(n) {
+  if (n == null) return "—";
   return `${Number(n).toLocaleString("ko-KR")}원`;
 }
 
@@ -46,6 +59,285 @@ function profitClass(pct) {
   if (pct > 0) return "profit-pos";
   if (pct < 0) return "profit-neg";
   return "";
+}
+
+function renderMonthlyPnlChart(byMonth) {
+  const canvas = $("monthly-pnl-chart");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const rows = byMonth || [];
+
+  if (monthlyPnlChart) monthlyPnlChart.destroy();
+  if (!rows.length) {
+    monthlyPnlChart = null;
+    return;
+  }
+
+  const labels = rows.map((r) => r.month);
+  const values = rows.map((r) => r.net_pnl_krw);
+  const colors = values.map((v) =>
+    v >= 0 ? "rgba(61, 214, 140, 0.75)" : "rgba(240, 113, 120, 0.75)"
+  );
+
+  monthlyPnlChart = new Chart(ctx, {
+    type: "bar",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "월별 순손익",
+          data: values,
+          backgroundColor: colors,
+          borderRadius: 6,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => formatWon(ctx.parsed.y),
+          },
+        },
+      },
+      scales: {
+        y: {
+          ticks: {
+            color: "#8b9cb3",
+            callback: (v) => `${Math.round(v / 10000)}만`,
+          },
+          grid: { color: "#2d3a4d" },
+        },
+        x: {
+          ticks: { color: "#8b9cb3" },
+          grid: { display: false },
+        },
+      },
+    },
+  });
+}
+
+function renderAccountSummary(acct) {
+  const badge = $("account-mode-badge");
+  const deltaEl = $("acct-delta-value");
+  const deltaPctEl = $("acct-delta-pct");
+  const line = $("account-trading-line");
+
+  if (!acct || !acct.trading_summary) {
+    badge.textContent = "—";
+    $("acct-total-value").textContent = "—";
+    deltaEl.textContent = "—";
+    deltaPctEl.textContent = "";
+    $("acct-initial-value").textContent = "—";
+    $("acct-trading-net").textContent = "—";
+    $("acct-win-rate").textContent = "—";
+    $("acct-fees-value").textContent = "—";
+    line.textContent = "거래 기록 없음";
+    line.className = "status-line muted";
+    renderMonthlyPnlChart([]);
+    return;
+  }
+
+  const ts = acct.trading_summary;
+  const as = acct.account_summary || {};
+  const total = as.total_assets_krw ?? acct.live_totals?.total_assets_krw;
+  const delta = as.balance_delta_krw;
+  const deltaPct = as.return_on_capital_pct;
+
+  badge.textContent = acct.trade_mode_label || "—";
+  $("acct-total-value").textContent = formatWonPlain(total);
+  deltaEl.textContent = formatWon(delta);
+  deltaEl.className = profitClass(delta);
+  deltaPctEl.textContent =
+    deltaPct != null ? `(${deltaPct >= 0 ? "+" : ""}${deltaPct}%)` : "";
+  deltaPctEl.className = profitClass(deltaPct);
+
+  $("acct-initial-value").textContent = formatWonPlain(acct.initial_capital_krw);
+  const netEl = $("acct-trading-net");
+  netEl.textContent = formatWon(ts.net_pnl_krw);
+  netEl.className = profitClass(ts.net_pnl_krw);
+
+  $("acct-win-rate").textContent =
+    ts.win_rate_pct != null
+      ? `${ts.win_rate_pct}% (${ts.wins}/${ts.count})`
+      : "—";
+
+  $("acct-fees-value").textContent = formatWon(-Math.abs(ts.total_fees_krw || 0));
+
+  line.textContent = `완결 ${ts.count}건 · 세전 ${formatWon(ts.gross_pnl_krw)} · 순손익 ${formatWon(ts.net_pnl_krw)}`;
+  line.className = `status-line ${profitClass(ts.net_pnl_krw)}`;
+
+  renderMonthlyPnlChart(acct.by_month || []);
+}
+
+function destroyStockChart() {
+  if (stockChart) {
+    stockChart.remove();
+    stockChart = null;
+    stockChartSeries = null;
+  }
+}
+
+function renderStockChart(data) {
+  const wrap = $("trade-chart-wrap");
+  const container = $("stock-candle-chart");
+  const tradesList = $("trade-chart-trades");
+  const loading = $("trade-chart-loading");
+
+  loading.classList.add("hidden");
+
+  if (data.error) {
+    wrap.classList.add("hidden");
+    tradesList.innerHTML = `<li class="error">${data.error}</li>`;
+    return;
+  }
+
+  if (!data.candles || !data.candles.length) {
+    wrap.classList.add("hidden");
+    tradesList.innerHTML = '<li class="muted">차트 데이터 없음</li>';
+    return;
+  }
+
+  wrap.classList.remove("hidden");
+  destroyStockChart();
+
+  if (typeof LightweightCharts === "undefined") {
+    tradesList.innerHTML = '<li class="error">차트 라이브러리 로드 실패</li>';
+    return;
+  }
+
+  container.innerHTML = "";
+  stockChart = LightweightCharts.createChart(container, {
+    width: container.clientWidth,
+    height: 280,
+    layout: {
+      background: { color: "#1a2332" },
+      textColor: "#8b9cb3",
+    },
+    grid: {
+      vertLines: { color: "#2d3a4d" },
+      horzLines: { color: "#2d3a4d" },
+    },
+    rightPriceScale: { borderColor: "#2d3a4d" },
+    timeScale: { borderColor: "#2d3a4d" },
+  });
+
+  stockChartSeries = stockChart.addCandlestickSeries({
+    upColor: "#3dd68c",
+    downColor: "#f07178",
+    borderVisible: false,
+    wickUpColor: "#3dd68c",
+    wickDownColor: "#f07178",
+  });
+  stockChartSeries.setData(data.candles);
+
+  const markers = (data.markers || []).map((m) => ({
+    time: m.time,
+    position: m.type === "buy" ? "belowBar" : "aboveBar",
+    color:
+      m.type === "buy"
+        ? "#3d8bfd"
+        : m.profit_pct != null && m.profit_pct < 0
+          ? "#f07178"
+          : "#3dd68c",
+    shape: m.type === "buy" ? "arrowUp" : "arrowDown",
+    text: m.type === "buy" ? "B" : "S",
+  }));
+  if (markers.length) {
+    stockChartSeries.setMarkers(markers);
+  }
+
+  stockChart.timeScale().fitContent();
+
+  tradesList.innerHTML = "";
+  const trades = data.trades || [];
+  if (!trades.length) {
+    tradesList.innerHTML = '<li class="muted">완결 거래 없음 (보유 중)</li>';
+    return;
+  }
+  for (const t of trades.slice().reverse()) {
+    const li = document.createElement("li");
+    const pct = t.profit_pct != null ? fmtPct(t.profit_pct) : "—";
+    li.innerHTML = `${t.entry_ts?.slice(0, 16) || "—"} → ${t.exit_ts?.slice(11, 16) || "—"} · ${t.qty}주 · ${pct} · 순${formatWon(t.net_pnl_krw)} · ${t.sell_reason || ""}`;
+    li.className = profitClass(t.net_pnl_krw);
+    tradesList.appendChild(li);
+  }
+}
+
+async function loadTradeStockChart(code, opts = {}) {
+  const silent = opts.silent === true;
+  selectedTradeCode = code;
+  if (!silent) {
+    $("trade-chart-loading").classList.remove("hidden");
+    $("trade-chart-wrap").classList.add("hidden");
+    $("trade-chart-trades").innerHTML = "";
+  }
+
+  document.querySelectorAll(".stock-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.code === code);
+  });
+
+  try {
+    const data = await api(
+      `/api/journal/trade-charts/${encodeURIComponent(code)}?days=90`
+    );
+    renderStockChart(data);
+  } catch (ex) {
+    if (!silent) {
+      $("trade-chart-loading").classList.add("hidden");
+      $("trade-chart-trades").innerHTML = `<li class="error">${ex.message}</li>`;
+    }
+  }
+}
+
+function renderTradeStockTabs(stocks) {
+  tradedStocksCache = stocks || [];
+  const tabs = $("trade-stock-tabs");
+  const empty = $("trade-chart-empty");
+  const count = $("trade-chart-count");
+  tabs.innerHTML = "";
+  count.textContent = String(tradedStocksCache.length);
+
+  if (!tradedStocksCache.length) {
+    empty.classList.remove("hidden");
+    destroyStockChart();
+    $("trade-chart-wrap").classList.add("hidden");
+    $("trade-chart-loading").classList.add("hidden");
+    return;
+  }
+  empty.classList.add("hidden");
+
+  for (const s of tradedStocksCache) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "stock-tab";
+    btn.dataset.code = s.code;
+    const pnl =
+      s.net_pnl_krw != null
+        ? ` · ${s.net_pnl_krw >= 0 ? "+" : ""}${s.net_pnl_krw.toLocaleString()}`
+        : "";
+    btn.innerHTML = `${s.name}<span class="tab-code">${s.code}${pnl}</span>`;
+    btn.addEventListener("click", () => loadTradeStockChart(s.code));
+    tabs.appendChild(btn);
+  }
+
+  const pick =
+    tradedStocksCache.find((s) => s.code === selectedTradeCode)?.code ||
+    tradedStocksCache[0].code;
+  loadTradeStockChart(pick);
+}
+
+async function loadTradedStocks() {
+  try {
+    const data = await api("/api/journal/traded-stocks?days=60&limit=12");
+    renderTradeStockTabs(data.stocks || []);
+  } catch (ex) {
+    $("trade-chart-empty").textContent = ex.message;
+    $("trade-chart-empty").classList.remove("hidden");
+  }
 }
 
 function renderHoldings(holdings) {
@@ -225,6 +517,7 @@ function renderDashboard(data) {
   $("auto-value").textContent = data.auto_trading ? "ON" : "OFF";
   $("auto-value").className = data.auto_trading ? "profit-pos" : "muted";
 
+  renderAccountSummary(data.account_summary);
   renderHoldings(data.holdings || []);
   renderChart(data.holdings || []);
 
@@ -251,24 +544,135 @@ function renderDashboard(data) {
 
   renderJournalStats(data.journal_stats);
   renderTrades(data.recent_trades || []);
-  $("updated-at").textContent = `갱신 ${data.updated_at}`;
+  $("updated-at").textContent = `전체 갱신 ${data.updated_at}`;
+  $("chart-updated-at").textContent = `차트 ${new Date().toLocaleTimeString("ko-KR")}`;
+
+  const ext = $("external-url");
+  if (data.external_url) {
+    ext.href = data.external_url;
+    ext.textContent = "외부 URL";
+    ext.classList.remove("hidden");
+  } else {
+    ext.classList.add("hidden");
+  }
 }
 
-async function loadDashboard() {
+async function refreshChartsOnly() {
+  try {
+    const data = await api("/api/dashboard");
+    renderChart(data.holdings || []);
+    if (data.account_summary) {
+      renderMonthlyPnlChart(data.account_summary.by_month || []);
+    }
+    if (selectedTradeCode) {
+      await loadTradeStockChart(selectedTradeCode, { silent: true });
+    }
+    $("chart-updated-at").textContent = `차트 ${new Date().toLocaleTimeString("ko-KR")}`;
+  } catch {
+    /* ignore background chart errors */
+  }
+}
+
+function showCommandResult(text, ok = true) {
+  const box = $("command-result");
+  box.textContent = text;
+  box.classList.remove("hidden", "command-error");
+  if (!ok) box.classList.add("command-error");
+}
+
+function hideCommandArgs() {
+  pendingCommand = null;
+  $("command-args-box").classList.add("hidden");
+  $("command-arg-input").value = "";
+}
+
+function openCommandArgs(item) {
+  pendingCommand = item;
+  $("command-args-label").textContent = item.args_label || "인자";
+  $("command-arg-input").placeholder = item.args_placeholder || "";
+  $("command-arg-input").value = "";
+  $("command-args-box").classList.remove("hidden");
+  $("command-arg-input").focus();
+}
+
+async function executeCommandText(text, refreshAfter = false) {
+  showCommandResult("실행 중…", true);
+  try {
+    const res = await api("/api/commands/run", {
+      method: "POST",
+      body: JSON.stringify({ text }),
+    });
+    showCommandResult(res.text || "(응답 없음)", res.ok !== false);
+    if (refreshAfter || /\/auto|\/buy|\/sell|\/mode|\/capital|\/reset|\/trendbuy/i.test(text)) {
+      await loadDashboard(true);
+    }
+  } catch (ex) {
+    showCommandResult(ex.message, false);
+  }
+}
+
+async function runCommandItem(item) {
+  if (item.needs_args) {
+    openCommandArgs(item);
+    return;
+  }
+  await executeCommandText(item.cmd, true);
+}
+
+function renderCommandMenu(menu) {
+  const root = $("command-groups");
+  root.innerHTML = "";
+  for (const group of menu.groups || []) {
+    const section = document.createElement("div");
+    section.className = "command-group";
+    const title = document.createElement("h3");
+    title.className = "stats-subhead";
+    title.textContent = group.group;
+    section.appendChild(title);
+    const grid = document.createElement("div");
+    grid.className = "command-grid";
+    for (const item of group.items || []) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "btn ghost small command-btn";
+      btn.textContent = item.label;
+      btn.title = item.cmd + (item.args_placeholder ? ` ${item.args_placeholder}` : "");
+      btn.addEventListener("click", () => runCommandItem(item));
+      grid.appendChild(btn);
+    }
+    section.appendChild(grid);
+    root.appendChild(section);
+  }
+}
+
+async function loadCommandMenu() {
+  try {
+    const menu = await api("/api/commands/menu");
+    renderCommandMenu(menu);
+  } catch (ex) {
+    $("command-groups").innerHTML = `<p class="error">${ex.message}</p>`;
+  }
+}
+
+async function loadDashboard(fullRefresh = true) {
   const data = await api("/api/dashboard");
   renderDashboard(data);
+  if (fullRefresh) {
+    await loadTradedStocks();
+    await loadCommandMenu();
+  }
 }
 
-function startAutoRefresh() {
-  stopAutoRefresh();
-  refreshTimer = setInterval(() => {
-    loadDashboard().catch(() => {});
-  }, REFRESH_MS);
+function startChartAutoRefresh() {
+  stopChartAutoRefresh();
+  chartRefreshTimer = setInterval(() => {
+    refreshChartsOnly();
+  }, CHART_REFRESH_MS);
 }
 
-function stopAutoRefresh() {
-  if (refreshTimer) clearInterval(refreshTimer);
-  refreshTimer = null;
+function stopChartAutoRefresh() {
+  if (chartRefreshTimer) clearInterval(chartRefreshTimer);
+  chartRefreshTimer = null;
 }
 
 $("login-form").addEventListener("submit", async (e) => {
@@ -286,33 +690,57 @@ $("login-form").addEventListener("submit", async (e) => {
     });
     setToken(res.access_token);
     show("dashboard");
-    await loadDashboard();
-    startAutoRefresh();
+    await loadDashboard(true);
+    startChartAutoRefresh();
   } catch (ex) {
     err.textContent = ex.message;
     err.classList.remove("hidden");
   }
 });
 
+$("command-args-run").addEventListener("click", () => {
+  if (!pendingCommand) return;
+  const args = $("command-arg-input").value.trim();
+  const text = args ? `${pendingCommand.cmd} ${args}` : pendingCommand.cmd;
+  hideCommandArgs();
+  executeCommandText(text, true);
+});
+
+$("command-args-cancel").addEventListener("click", hideCommandArgs);
+
+$("command-arg-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") $("command-args-run").click();
+  if (e.key === "Escape") hideCommandArgs();
+});
+
 $("logout-btn").addEventListener("click", () => {
-  stopAutoRefresh();
+  stopChartAutoRefresh();
   setToken(null);
   show("login");
 });
 
-$("refresh-btn").addEventListener("click", () => {
-  loadDashboard().catch((ex) => {
+$("refresh-btn").addEventListener("click", async () => {
+  const btn = $("refresh-btn");
+  btn.disabled = true;
+  btn.textContent = "갱신 중…";
+  $("error-banner").classList.add("hidden");
+  try {
+    await loadDashboard(true);
+  } catch (ex) {
     $("error-banner").textContent = ex.message;
     $("error-banner").classList.remove("hidden");
-  });
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "전체 새로고침";
+  }
 });
 
 async function init() {
   if (getToken()) {
     try {
       show("dashboard");
-      await loadDashboard();
-      startAutoRefresh();
+      await loadDashboard(true);
+      startChartAutoRefresh();
       return;
     } catch {
       setToken(null);

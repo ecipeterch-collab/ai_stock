@@ -8,15 +8,28 @@ from datetime import date, datetime, timedelta
 import requests
 
 from config.config import (
+    chart_filter_enabled,
+    chart_eval_max_candidates,
     default_order_qty,
     position_sizing_enabled,
     position_target_krw,
     position_min_qty,
     position_max_qty,
+    position_addon_enabled,
+    position_addon_min_drop_pct,
+    position_addon_quality_max_rank,
+    position_addon_momentum_min_peak_pct,
+    position_addon_max_per_day,
+    position_addon_max_qty_multiplier,
     strategy_swing_breakeven_activate_pct,
     strategy_swing_breakeven_floor_pct,
     strategy_swing_protect_trailing_activate_pct,
     strategy_swing_protect_trailing_drawdown_pct,
+    strategy_swing_stagnation_minutes,
+    strategy_swing_stagnation_max_profit_pct,
+    strategy_loser_reentry_cooldown_hours,
+    strategy_momentum_buy_enabled,
+    strategy_momentum_window_end,
     dmst_stex_tp,
     use_paper,
     fill_poll_interval_sec,
@@ -95,21 +108,30 @@ from config.config import (
     strategy_trailing_activate_pct,
     strategy_trailing_drawdown_pct,
     trend_auto_buy_enabled,
+    regime_enabled,
+    drawdown_scale_enabled,
+    regime_scan_top,
+    drawdown_benchmark_code,
 )
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from trading.market_utils import (
+    calc_profit_pct,
     is_buy_window,
     is_market_open,
     market_status_text,
     parse_hhmm,
 )
+from trading.journal_stats import build_daily_summary, format_daily_summary_text
+from trading.account_pnl import build_account_summary, format_account_summary_text
 from trading.position_tracker import PositionState, PositionTracker
 from trading.news_analyzer import MarketNewsAnalyzer, MarketNewsContext
 from trading.scoring import (
     CandidateView,
     filter_and_rank_candidates,
     is_market_bullish,
+    is_momentum_candidate,
     market_bullish_stats,
+    qualifies_for_position_addon,
 )
 from trading.symbol_filters import is_leveraged_etf
 from trading.runtime_config import (
@@ -122,10 +144,18 @@ from trading.runtime_config import (
     is_scalping_mode,
     mode_label,
 )
+from trading.chart_signals import ChartSignalAnalyzer, ChartSignalResult
 from trading.crash_buy import (
     filter_crash_candidates,
     is_bear_market,
 )
+from trading.market_regime import (
+    MarketContext,
+    format_buy_meta,
+    is_channel_allowed,
+    detect_regime,
+)
+from trading.drawdown_scale import DrawdownScaleCalculator, scale_multiplier_for_channel
 from trading.scalping import (
     evaluate_scalp_sell,
     filter_scalp_candidates,
@@ -197,7 +227,11 @@ class AutoTradingStrategy:
         self._trend_buy_count = 0
         self._crash_buy_count_date: date | None = None
         self._crash_buy_count = 0
+        self._addon_buys_today: dict[str, int] = {}
         self._seen_fill_keys: set[str] = set()
+        self._holdings_cache: list[HoldingView] | None = None
+        self._holdings_cache_ts: float = 0.0
+        self._holdings_cache_ttl_sec: float = 3.0
         self._buy_block_until: datetime | None = None
         self._stop_buy_for_day: bool = False
         self._circuit_reset_date: date | None = None
@@ -206,6 +240,55 @@ class AutoTradingStrategy:
         self.news = MarketNewsAnalyzer()
         self.trends = TrendScanner(client)
         self.journal = TradeJournal()
+        self.chart = ChartSignalAnalyzer(client)
+        self._drawdown = DrawdownScaleCalculator(client)
+        self._cycle_ctx: MarketContext | None = None
+        self._seed_seen_fills_from_journal()
+
+    def _seed_seen_fills_from_journal(self) -> None:
+        """재시작 시 과거 체결을 다시 알림하지 않도록 저널에서 키 복원."""
+        for event in self.journal.read_all():
+            if event.event != "fill" or not event.ord_no:
+                continue
+            self._seen_fill_keys.add(
+                "|".join(
+                    [
+                        event.ord_no,
+                        event.code or "",
+                        str(event.price or ""),
+                        str(event.qty or ""),
+                        "",
+                    ]
+                )
+            )
+
+    def _invalidate_holdings_cache(self) -> None:
+        self._holdings_cache = None
+        self._holdings_cache_ts = 0.0
+
+    def _pick_with_chart_filter(
+        self,
+        eligible: list[tuple[CandidateView, float]],
+        *,
+        allow_momentum: bool = False,
+        channel_pullback: bool = True,
+    ) -> tuple[CandidateView, float, ChartSignalResult] | None:
+        """차트 필터 통과 후보 중 최고 점수 선택."""
+        pool = eligible[: max(1, int(chart_eval_max_candidates))]
+        if chart_filter_enabled and pool:
+            self.chart.prefetch_daily([cand.code for cand, _ in pool])
+        best: tuple[CandidateView, float, ChartSignalResult] | None = None
+        for cand, score in pool:
+            momentum = allow_momentum and is_momentum_candidate(cand)
+            if not momentum and not channel_pullback:
+                continue
+            chart = self.chart.evaluate_candidate(cand, momentum=momentum)
+            if not chart.passed:
+                continue
+            total = score + self.chart.chart_score_bonus(chart)
+            if best is None or total > best[1]:
+                best = (cand, total, chart)
+        return best
 
     def enable(self) -> None:
         self.enabled = True
@@ -313,9 +396,11 @@ class AutoTradingStrategy:
         self._reset_daily_counter()
         reasons = self.peek_buy_block_reasons()
         pnl_pct = self._compute_today_pnl_pct()
+        pnl_krw = self._compute_today_pnl_krw()
         lines = ["【매수 상태】"]
         if pnl_pct is not None:
-            lines.append(f"오늘 누적 손익률(근사): {pnl_pct:+.2f}%")
+            krw_txt = f" · 순손익 {pnl_krw:+,}원" if pnl_krw is not None else ""
+            lines.append(f"오늘 누적 손익률(근사): {pnl_pct:+.2f}%{krw_txt}")
         else:
             lines.append("오늘 누적 손익률(근사): 거래 없음")
         if reasons:
@@ -338,7 +423,39 @@ class AutoTradingStrategy:
                 f"참고: 급락 우량주 매수 ON (일 {self._crash_buy_count}/"
                 f"{strategy_crash_max_buys_per_day}회, 하락장 전용)"
             )
+        if self._cycle_ctx and self._cycle_ctx.regime:
+            r = self._cycle_ctx.regime
+            lines.append(f"국면: {r.label} ({r.message})")
+        if self._cycle_ctx and self._cycle_ctx.drawdown:
+            lines.append(f"드로다운: {self._cycle_ctx.drawdown.message}")
         return "\n".join(lines)
+
+    def _compute_today_pnl_krw(self) -> int | None:
+        """오늘 완결 매매 순손익(원, 수수료·세금 반영)."""
+        try:
+            summary = build_daily_summary()
+            net = (summary.get("summary") or {}).get("net_pnl_krw")
+            if net is None:
+                return None
+            return int(net)
+        except OSError:
+            return None
+
+    def get_account_summary(self, *, include_live_balance: bool = True) -> str:
+        """원금 대비 실계좌 손익 요약."""
+        try:
+            summary = build_account_summary(include_live_balance=include_live_balance)
+            return format_account_summary_text(summary)
+        except OSError as exc:
+            return f"【원금 대비 손익】\n조회 실패: {exc}"
+
+    def get_daily_pnl_summary(self, target_date: date | None = None) -> str:
+        """일별 매매·손익 요약 텍스트."""
+        try:
+            summary = build_daily_summary(target_date=target_date)
+            return format_daily_summary_text(summary)
+        except OSError as exc:
+            return f"【매매·손익】\n저널 조회 실패: {exc}"
 
     def _compute_today_pnl_pct(self) -> float | None:
         """오늘 매매 기준 누적 손익률(%) 근사."""
@@ -349,7 +466,12 @@ class AutoTradingStrategy:
         buys_by_code: dict[str, list[tuple[int, int]]] = {}
         invested = 0
         for e in events:
-            if e.event not in ("buy_order", "trend_buy_order", "crash_buy_order"):
+            if e.event not in (
+                "buy_order",
+                "trend_buy_order",
+                "crash_buy_order",
+                "addon_buy_order",
+            ):
                 continue
             qty = int(e.qty or 0)
             price = int(e.price or 0)
@@ -364,7 +486,7 @@ class AutoTradingStrategy:
 
         pnl_amount = 0.0
         for e in events:
-            if e.event != "sell_order" or e.profit_pct is None:
+            if e.event != "sell_order":
                 continue
             q = int(e.qty or 0)
             if q <= 0:
@@ -373,10 +495,14 @@ class AutoTradingStrategy:
             if not queue:
                 continue
             remain = q
+            sell_price = int(e.price or 0)
             while remain > 0 and queue:
                 bq, bp = queue[0]
                 take = min(remain, bq)
-                pnl_amount += (take * bp) * (float(e.profit_pct) / 100.0)
+                if sell_price > 0 and bp > 0:
+                    pnl_amount += take * (sell_price - bp)
+                elif e.profit_pct is not None:
+                    pnl_amount += (take * bp) * (float(e.profit_pct) / 100.0)
                 remain -= take
                 if take == bq:
                     queue.pop(0)
@@ -414,17 +540,71 @@ class AutoTradingStrategy:
         return None
 
     @staticmethod
-    def _calc_order_qty(price: int) -> int:
+    def _base_order_qty(price: int, *, scale_mult: float = 1.0) -> int:
         """종목당 목표 금액 기준 주문 수량. 비활성/가격 0이면 기본 수량."""
         if not position_sizing_enabled or not price or price <= 0:
             return max(1, int(default_order_qty))
         target = max(0, int(position_target_krw))
         if target <= 0:
             return max(1, int(default_order_qty))
+        if scale_mult > 0 and scale_mult != 1.0:
+            target = int(target * scale_mult)
         qty = target // int(price)
         qty = max(int(position_min_qty), int(qty))
         qty = min(int(position_max_qty), qty)
         return max(1, qty)
+
+    def _channel_scale_mult(self, channel: str) -> float:
+        if not drawdown_scale_enabled or not self._cycle_ctx:
+            return 1.0
+        return scale_multiplier_for_channel(self._cycle_ctx.drawdown, channel)
+
+    def _calc_order_qty(self, price: int, *, channel: str = "pullback") -> int:
+        return self._base_order_qty(
+            price, scale_mult=self._channel_scale_mult(channel)
+        )
+
+    def _buy_reason_prefix(self, channel: str) -> str:
+        snap = self._cycle_ctx.regime if self._cycle_ctx else None
+        scale = self._channel_scale_mult(channel)
+        return format_buy_meta(snap, scale_mult=scale)
+
+    def _merge_buy_reason(self, channel: str, detail: str) -> str:
+        prefix = self._buy_reason_prefix(channel)
+        if prefix and detail:
+            return f"{prefix} · {detail}"
+        return prefix or detail
+
+    def _resolve_cycle_context(
+        self,
+        news: MarketNewsContext | None = None,
+    ) -> MarketContext:
+        """한 사이클당 국면·드로다운·후보 종목을 한 번 계산."""
+        ctx = MarketContext()
+        if not regime_enabled and not drawdown_scale_enabled:
+            self._cycle_ctx = ctx
+            return ctx
+
+        scan_top = max(
+            regime_scan_top,
+            strategy_scan_rank_top,
+            strategy_crash_scan_rank_top,
+            scalping_scan_rank_top if is_scalping_mode() else 0,
+        )
+        try:
+            rank_items = self.client.get_trade_value_rank(top_n=scan_top)
+            candidates = self._parse_candidates(rank_items)
+            ctx.candidates = candidates
+            if regime_enabled and candidates:
+                risk = news.risk_score if news else None
+                ctx.regime = detect_regime(candidates, news_risk_score=risk)
+            if drawdown_scale_enabled:
+                ctx.drawdown = self._drawdown.compute()
+        except (KiwoomAPIError, requests.RequestException):
+            pass
+
+        self._cycle_ctx = ctx
+        return ctx
 
     @staticmethod
     def _krx_tick_size(price: int) -> int:
@@ -503,6 +683,34 @@ class AutoTradingStrategy:
             )
         return None
 
+    def _recent_loss_blocked_codes(self) -> dict[str, str]:
+        """최근 손실 청산 종목 → 차단 사유. 반복 손실 재매수 방지."""
+        hours = float(strategy_loser_reentry_cooldown_hours)
+        if hours <= 0:
+            return {}
+        now = datetime.now()
+        last_sells: dict[str, tuple[datetime, float]] = {}
+        for e in self.journal.tail(500):
+            if e.event != "sell_order" or not e.code or e.profit_pct is None:
+                continue
+            try:
+                ts = datetime.fromisoformat(e.ts)
+            except ValueError:
+                continue
+            last_sells[e.code] = (ts, float(e.profit_pct))
+
+        blocked: dict[str, str] = {}
+        for code, (ts, pnl) in last_sells.items():
+            if pnl >= 0:
+                continue
+            elapsed_h = (now - ts).total_seconds() / 3600.0
+            if elapsed_h < hours:
+                blocked[code] = (
+                    f"최근 손실 {pnl:+.2f}% "
+                    f"(경과 {elapsed_h:.0f}h < {hours:.0f}h)"
+                )
+        return blocked
+
     def get_rules_summary(self) -> str:
         if is_scalping_mode():
             ms, me, as_, ae = effective_buy_windows()
@@ -543,6 +751,8 @@ class AutoTradingStrategy:
             f"→ -{strategy_swing_trailing_drawdown_pct}%p\n"
             f"  · 손절: -{strategy_stop_loss_pct}% · 청산: "
             f"{'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
+            f"  · 정체 청산: {strategy_swing_stagnation_minutes}분+ 보유 & "
+            f"+{strategy_swing_stagnation_max_profit_pct:.1f}% 미만\n"
             f"  · 장마감: {cut} 손실 정리"
             + (
                 f" · {eod} 전량"
@@ -557,9 +767,33 @@ class AutoTradingStrategy:
             "■ 매수 (눌림·완만상승)\n"
             f"  · 거래대금 상위 {strategy_scan_rank_top} · 점수 ≥{strategy_min_score}\n"
             f"  · 등락 {strategy_min_flu_rt}~{strategy_max_flu_rt}%\n"
-            f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분\n"
-            f"  · 시간: {ms}~{me}, {as_}~{ae}\n\n"
-            "■ 트렌드: 핫테마 연관 눌림목\n"
+            f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
+            f"손실 종목 {strategy_loser_reentry_cooldown_hours:.0f}h 차단\n"
+            + (
+                f"  · 시간: {ms}~{me} (오후 매수 없음)\n"
+                if as_ == ae
+                else f"  · 시간: {ms}~{me}, {as_}~{ae}\n"
+            )
+            + (
+                f"  · 모멘텀 채널: ~{strategy_momentum_window_end} "
+                "상승 중·순위 급등 허용\n"
+                if strategy_momentum_buy_enabled
+                else "\n"
+            )
+            + (
+                f"  · 추가매수: 진입가 -{position_addon_min_drop_pct:.1f}%↓ · "
+                f"우량 상위{position_addon_quality_max_rank}위/모멘텀 · "
+                f"종목당 일{position_addon_max_per_day}회 · "
+                f"최대 {position_addon_max_qty_multiplier:.0f}배\n"
+                if position_addon_enabled and not is_scalping_mode()
+                else ""
+            )
+            + (
+                f"  · 종목당 목표 {position_target_krw:,}원\n"
+                if position_sizing_enabled
+                else ""
+            )
+            + "■ 트렌드: 핫테마 연관 눌림목\n"
             + (
                 f"■ 급락 우량주: 하락장 · 상위 {strategy_crash_max_rank}위 · "
                 f"{strategy_crash_min_flu_rt}~{strategy_crash_max_flu_rt}% · "
@@ -568,7 +802,19 @@ class AutoTradingStrategy:
                 else ""
             )
             + "■ 연속손실 브레이커: 3회→60분 / 5회→당일중지\n"
-            "■ /mode swing|scalping · /auto on · /report"
+            + (
+                "■ 국면감지: 강세(모멘텀·눌림·트렌드) / "
+                "횡보(눌림·트렌드) / 약세·고변동(급락)\n"
+                if regime_enabled
+                else ""
+            )
+            + (
+                f"■ 드로다운스케일: {drawdown_benchmark_code} MDD 구간별 "
+                f"최대 {drawdown_scale_max_mult:.1f}배\n"
+                if drawdown_scale_enabled
+                else ""
+            )
+            + "■ /mode swing|scalping · /auto on · /report"
         )
 
     def get_news_briefing(self) -> str:
@@ -605,6 +851,8 @@ class AutoTradingStrategy:
         except (KiwoomAPIError, requests.RequestException) as exc:
             lines.append(f"잔고 조회 실패: {exc}")
         lines.append(self.journal.format_recent_summary(10))
+        lines.append(self.get_daily_pnl_summary())
+        lines.append(self.get_account_summary())
         lines.append(self._format_buy_status())
         lines.append(
             self._heartbeat(
@@ -636,6 +884,7 @@ class AutoTradingStrategy:
             f"자동매매: {'ON' if self.enabled else 'OFF'} · "
             f"일반매수 {self._buy_count}/{effective_max_buys_per_day()}회\n\n"
             f"{account}\n\n"
+            f"{self.get_account_summary()}\n\n"
             "상세 보유: /balance 또는 /portfolio"
         )
 
@@ -676,6 +925,8 @@ class AutoTradingStrategy:
             sections.append(f"【보유 종목】\n조회 실패: {exc}")
 
         sections.append(self._format_buy_status())
+        sections.append(self.get_daily_pnl_summary())
+        sections.append(self.get_account_summary(include_live_balance=False))
         sections.append(self.journal.format_recent_summary(5))
         return "\n\n".join(sections)
 
@@ -685,12 +936,24 @@ class AutoTradingStrategy:
         if self._buy_count_date != today:
             self._buy_count_date = today
             self._buy_count = 0
+            self._addon_buys_today = {}
         if self._trend_buy_count_date != today:
             self._trend_buy_count_date = today
             self._trend_buy_count = 0
         if self._crash_buy_count_date != today:
             self._crash_buy_count_date = today
             self._crash_buy_count = 0
+
+    def _can_addon_buy_today(self, code: str) -> bool:
+        self._reset_daily_counter()
+        return (
+            self._addon_buys_today.get(code, 0) < position_addon_max_per_day
+        )
+
+    def _record_addon_buy(self, code: str) -> None:
+        self._reset_daily_counter()
+        self._buy_count += 1
+        self._addon_buys_today[code] = self._addon_buys_today.get(code, 0) + 1
 
     def _can_buy_today(self) -> bool:
         self._reset_daily_counter()
@@ -832,7 +1095,15 @@ class AutoTradingStrategy:
             result.add_event(self._format_fill_message(fill))
             self._journal_fill(fill)
 
-    def _parse_holdings(self) -> list[HoldingView]:
+    def _parse_holdings(self, *, force_refresh: bool = False) -> list[HoldingView]:
+        now = time.monotonic()
+        if (
+            not force_refresh
+            and self._holdings_cache is not None
+            and now - self._holdings_cache_ts < self._holdings_cache_ttl_sec
+        ):
+            return self._holdings_cache
+
         holdings: list[HoldingView] = []
         for item in self.client.get_holdings():
             raw_code = item.get("stk_cd", "")
@@ -847,7 +1118,18 @@ class AutoTradingStrategy:
                 continue
             profit = self.client.parse_percent(item.get("prft_rt", "0"))
             purchase = self.client.parse_price(item.get("pur_pric", "0"))
+            current = self.client.parse_price(item.get("cur_prc", "0"))
             name = item.get("stk_nm", code)
+            state = self.positions.get(code)
+            entry_price = (
+                state.entry_price
+                if state and state.entry_price > 0
+                else purchase
+            )
+            if entry_price > 0 and current > 0:
+                computed = calc_profit_pct(entry_price, current)
+                if computed is not None:
+                    profit = computed
             self.positions.sync_holding(code, name, purchase, profit)
             holdings.append(
                 HoldingView(
@@ -856,7 +1138,7 @@ class AutoTradingStrategy:
                     qty=qty,
                     sellable_qty=sellable,
                     profit_pct=profit,
-                    current_price=self.client.parse_price(item.get("cur_prc", "0")),
+                    current_price=current,
                     purchase_price=purchase,
                     order_code=code,
                     raw=item,
@@ -869,6 +1151,8 @@ class AutoTradingStrategy:
                 self.positions.remove(code)
             elif self._should_suppress_holding_sync(code):
                 self.positions.remove(code)
+        self._holdings_cache = holdings
+        self._holdings_cache_ts = time.monotonic()
         return holdings
 
     def _parse_candidates(self, rank_items: list[dict]) -> list[CandidateView]:
@@ -1001,6 +1285,23 @@ class AutoTradingStrategy:
         if profit <= -strategy_stop_loss_pct:
             return f"손절 ({profit:.2f}% <= -{strategy_stop_loss_pct}%)", qty, None
 
+        # 정체 청산(time-stop): 장시간 보유에도 수익 전환 실패 시 정리
+        stagnation_min = max(0, int(strategy_swing_stagnation_minutes))
+        if stagnation_min > 0:
+            hold_min = self.positions.holding_minutes(holding.code)
+            if (
+                hold_min is not None
+                and hold_min >= stagnation_min
+                and profit < float(strategy_swing_stagnation_max_profit_pct)
+            ):
+                return (
+                    f"정체 청산 (보유 {hold_min:.0f}분 ≥ {stagnation_min}분, "
+                    f"수익 {profit:.2f}% < "
+                    f"+{strategy_swing_stagnation_max_profit_pct:.1f}%)",
+                    qty,
+                    None,
+                )
+
         # 부분 익절 후에만 트레일링 (조기 청산 방지)
         if stage_done >= 1 and peak >= strategy_swing_trailing_activate_pct:
             trail_floor = peak - strategy_swing_trailing_drawdown_pct
@@ -1104,14 +1405,26 @@ class AutoTradingStrategy:
                     dmst_stex_tp=dmst_stex_tp,
                 )
             ord_no = order.get("ord_no", "")
+            state = self.positions.get(holding.code)
+            entry_price = (
+                state.entry_price
+                if state and state.entry_price > 0
+                else holding.purchase_price
+            )
+            sell_price = holding.current_price or 0
+            profit_pct = holding.profit_pct
+            if entry_price > 0 and sell_price > 0:
+                computed = calc_profit_pct(entry_price, sell_price)
+                if computed is not None:
+                    profit_pct = computed
             try:
                 self.journal.log(
                     "sell_order",
                     code=holding.code,
                     name=holding.name,
                     qty=sell_qty,
-                    price=holding.current_price or None,
-                    profit_pct=holding.profit_pct,
+                    price=sell_price or None,
+                    profit_pct=profit_pct,
                     reason=reason + (f" / 지정가 {limit_price}" if limit_price else ""),
                     ord_no=ord_no,
                 )
@@ -1122,7 +1435,7 @@ class AutoTradingStrategy:
                 f"사유: {reason}\n"
                 f"종목: {holding.name}({holding.code})\n"
                 f"수량: {sell_qty}주 / 매매가능 {holding.sellable_qty}주\n"
-                f"수익률: {holding.profit_pct:+.2f}%\n"
+                f"수익률: {profit_pct:+.2f}%\n"
                 f"주문: {'지정가' if limit_price else '시장가'}\n"
                 f"주문번호: {ord_no}\n"
                 f"{order.get('return_msg', '')}"
@@ -1217,10 +1530,13 @@ class AutoTradingStrategy:
         self,
         result: AutoRunResult,
         news: MarketNewsContext | None = None,
+        *,
+        holdings: list[HoldingView] | None = None,
     ) -> int:
         sold_count = 0
         try:
-            holdings = self._parse_holdings()
+            if holdings is None:
+                holdings = self._parse_holdings()
         except (KiwoomAPIError, requests.RequestException) as exc:
             result.add_event(f"잔고 조회 실패(매도): {exc}")
             return 0
@@ -1260,6 +1576,7 @@ class AutoTradingStrategy:
                     holding, reason, sell_qty, result, partial=is_partial, tp_stage=tp_stage
                 ):
                     sold_count += 1
+                    self._invalidate_holdings_cache()
         return sold_count
 
     def _portfolio_heat_blocks_buy(self, holdings: list[HoldingView]) -> str | None:
@@ -1270,13 +1587,161 @@ class AutoTradingStrategy:
             return f"손실 종목 {len(losers)}개 ({names}) - 신규매수 중단"
         return None
 
+    def _try_addon_buys(
+        self,
+        result: AutoRunResult,
+        holdings: list[HoldingView],
+        candidates: list[CandidateView],
+    ) -> None:
+        """보유 종목 중 우량·모멘텀 + 진입가 하락 시 추가매수."""
+        if not position_addon_enabled or is_scalping_mode() or not holdings:
+            return
+        snap = self._cycle_ctx.regime if self._cycle_ctx else None
+        if snap and not is_channel_allowed(snap, "addon"):
+            return
+
+        loss_blocked = self._recent_loss_blocked_codes()
+        by_code = {c.code: c for c in candidates}
+
+        for holding in sorted(holdings, key=lambda h: h.profit_pct):
+            if not self._can_addon_buy_today(holding.code):
+                continue
+            if holding.code in loss_blocked:
+                continue
+            if holding.sellable_qty <= 0 and holding.qty > 0:
+                continue
+
+            candidate = by_code.get(holding.code)
+            if candidate is None:
+                continue
+
+            state = self.positions.get(holding.code)
+            peak = state.peak_profit_pct if state else holding.profit_pct
+            ok, tag = qualifies_for_position_addon(
+                candidate=candidate,
+                holding_profit_pct=holding.profit_pct,
+                peak_profit_pct=peak,
+                min_drop_pct=position_addon_min_drop_pct,
+                quality_max_rank=position_addon_quality_max_rank,
+                momentum_min_peak_pct=position_addon_momentum_min_peak_pct,
+            )
+            if not ok:
+                continue
+
+            chart = self.chart.evaluate(
+                code=holding.code,
+                current_price=holding.current_price,
+                mode="pullback",
+            )
+            if chart_filter_enabled and not chart.passed:
+                continue
+
+            baseline_qty = max(
+                (state.entry_qty if state else 0),
+                holding.qty,
+                1,
+            )
+            order_qty = self._calc_order_qty(holding.current_price, channel="addon")
+            max_total = int(baseline_qty * position_addon_max_qty_multiplier)
+            max_total = min(max_total, int(position_max_qty))
+            if holding.qty + order_qty > max_total:
+                order_qty = max(0, max_total - holding.qty)
+            if order_qty <= 0:
+                continue
+
+            self._execute_addon_buy(
+                holding,
+                candidate,
+                order_qty,
+                tag,
+                chart,
+                result,
+            )
+            self._invalidate_holdings_cache()
+            return
+
+    def _execute_addon_buy(
+        self,
+        holding: HoldingView,
+        candidate: CandidateView,
+        order_qty: int,
+        tag: str,
+        chart: ChartSignalResult,
+        result: AutoRunResult,
+    ) -> None:
+        try:
+            order = self.client.buy_market(
+                holding.code,
+                order_qty,
+                dmst_stex_tp=dmst_stex_tp,
+            )
+            self._record_addon_buy(holding.code)
+            ord_no = order.get("ord_no", "")
+            self.positions.add_to_position(
+                holding.code,
+                order_qty,
+                holding.current_price,
+                profit_pct=holding.profit_pct,
+            )
+            reason = self._merge_buy_reason(
+                "addon",
+                (
+                    f"추가매수({tag}) 진입대비 {holding.profit_pct:+.2f}% · "
+                    f"{candidate.rank}위"
+                ),
+            )
+            if chart.reasons:
+                reason += f" / 차트 {chart.score:.0f} ({', '.join(chart.reasons)})"
+            try:
+                self.journal.log(
+                    "addon_buy_order",
+                    code=holding.code,
+                    name=holding.name,
+                    qty=order_qty,
+                    price=holding.current_price,
+                    reason=reason,
+                    ord_no=ord_no,
+                )
+            except Exception:
+                pass
+            buy_msg = (
+                "【추가 매수】\n"
+                f"종목: {holding.name}({holding.code})\n"
+                f"유형: {tag} · 진입대비 {holding.profit_pct:+.2f}%\n"
+                f"거래대금 {candidate.rank}위 · 등락 {candidate.flu_rt:+.2f}%\n"
+                f"수량: {order_qty}주 시장가 (보유 {holding.qty}→{holding.qty + order_qty}주)\n"
+                f"주문번호: {ord_no}\n"
+                f"{order.get('return_msg', '')}"
+            )
+            result.add_event(buy_msg)
+            fill_msg = self.check_order_fill(
+                ord_no, holding.code, stk_nm=holding.name
+            )
+            if fill_msg and is_event_message(fill_msg):
+                result.add_event(fill_msg)
+            elif fill_msg:
+                result.add_report(fill_msg)
+        except KiwoomAPIError as exc:
+            result.add_event(
+                f"【추가매수 실패】 {holding.name}({holding.code})\n{exc}"
+            )
+        except requests.RequestException as exc:
+            result.add_event(
+                f"【추가매수 실패】 {holding.name}\n네트워크: {exc}"
+            )
+
     def _run_buy_phase(
         self,
         result: AutoRunResult,
         holdings: list[HoldingView],
         news: MarketNewsContext | None = None,
+        *,
+        candidates: list[CandidateView] | None = None,
     ) -> None:
         held_codes = {h.code for h in holdings}
+        snap = self._cycle_ctx.regime if self._cycle_ctx else None
+        channel_pullback = is_channel_allowed(snap, "pullback")
+        channel_momentum = is_channel_allowed(snap, "momentum")
 
         if news and not news.allow_buy:
             result.add_report(
@@ -1299,13 +1764,6 @@ class AutoTradingStrategy:
             result.add_report(self._heartbeat(breaker))
             return
 
-        max_pos = effective_max_positions()
-        if len(holdings) >= max_pos:
-            result.add_report(
-                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
-            )
-            return
-
         if not self._can_buy_today():
             result.add_report(
                 self._heartbeat(f"일일 매수 한도 ({effective_max_buys_per_day()}회)")
@@ -1319,20 +1777,55 @@ class AutoTradingStrategy:
             )
             return
 
+        scan_top = scalping_scan_rank_top if is_scalping_mode() else strategy_scan_rank_top
+
+        if candidates is None:
+            try:
+                rank_items = self.client.get_trade_value_rank(top_n=scan_top)
+                candidates = self._parse_candidates(rank_items)
+            except (KiwoomAPIError, requests.RequestException) as exc:
+                result.add_report(self._heartbeat(f"순위 조회 실패 - {exc}"))
+                return
+
+        if position_addon_enabled and not is_scalping_mode():
+            self._try_addon_buys(result, holdings, candidates)
+
+        if is_scalping_mode():
+            if not channel_pullback:
+                result.add_report(
+                    self._heartbeat(
+                        f"국면 {snap.label if snap else '—'} - 스캘핑 매수 채널 OFF"
+                    )
+                )
+                return
+        else:
+            momentum_window = (
+                strategy_momentum_buy_enabled
+                and datetime.now().time()
+                <= parse_hhmm(strategy_momentum_window_end)
+            )
+            allow_momentum = momentum_window and channel_momentum
+            if not channel_pullback and not allow_momentum:
+                result.add_report(
+                    self._heartbeat(
+                        f"국면 {snap.label if snap else '—'} - 일반매수 채널 OFF"
+                    )
+                )
+                return
+
+        max_pos = effective_max_positions()
+        if len(holdings) >= max_pos:
+            result.add_report(
+                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
+            )
+            return
+
         heat = self._portfolio_heat_blocks_buy(holdings)
         if heat:
             result.add_report(self._heartbeat(heat))
             return
 
-        scan_top = scalping_scan_rank_top if is_scalping_mode() else strategy_scan_rank_top
         min_score = scalping_min_score if is_scalping_mode() else strategy_min_score
-
-        try:
-            rank_items = self.client.get_trade_value_rank(top_n=scan_top)
-            candidates = self._parse_candidates(rank_items)
-        except (KiwoomAPIError, requests.RequestException) as exc:
-            result.add_report(self._heartbeat(f"순위 조회 실패 - {exc}"))
-            return
 
         if is_scalping_mode():
             bullish, market_msg = is_scalp_market_bullish(candidates)
@@ -1358,7 +1851,27 @@ class AutoTradingStrategy:
             result.add_report(self._heartbeat(f"매수 보류 - {market_msg}"))
             return
 
-        eligible, rejected = filter_fn(candidates, held_codes)
+        self.chart.prune_stale_cache()
+
+        if is_scalping_mode():
+            eligible, rejected = filter_fn(candidates, held_codes)
+        else:
+            # 아침 모멘텀 채널: 지정 시각까지 러너 프로필(상승 중+순위 급등) 허용
+            allow_momentum = (
+                strategy_momentum_buy_enabled
+                and channel_momentum
+                and datetime.now().time()
+                <= parse_hhmm(strategy_momentum_window_end)
+            )
+            eligible, rejected = filter_and_rank_candidates(
+                candidates, held_codes, allow_momentum=allow_momentum
+            )
+            if not channel_pullback:
+                eligible = [
+                    (cand, score)
+                    for cand, score in eligible
+                    if is_momentum_candidate(cand)
+                ]
         if not eligible:
             detail = rejected[0] if rejected else "조건 충족 없음"
             result.add_report(self._heartbeat(f"매수 보류 - {detail}"))
@@ -1387,9 +1900,46 @@ class AutoTradingStrategy:
                 return
             eligible = filtered
 
-        best, score = eligible[0]
+        # 최근 손실 청산 종목 재진입 차단 (반복 손실 방지)
+        loss_blocked = self._recent_loss_blocked_codes()
+        if loss_blocked:
+            blocked_notes: list[str] = []
+            filtered = []
+            for cand, score in eligible:
+                note = loss_blocked.get(cand.code)
+                if note:
+                    blocked_notes.append(f"{cand.name}({cand.code}) {note}")
+                    continue
+                filtered.append((cand, score))
+            if not filtered:
+                note = blocked_notes[0] if blocked_notes else "손실 쿨다운"
+                result.add_report(self._heartbeat(f"손실 재진입 차단 - {note}"))
+                return
+            eligible = filtered
+
+        allow_momentum = (
+            not is_scalping_mode()
+            and strategy_momentum_buy_enabled
+            and channel_momentum
+            and datetime.now().time() <= parse_hhmm(strategy_momentum_window_end)
+        )
+        picked = self._pick_with_chart_filter(
+            eligible,
+            allow_momentum=allow_momentum,
+            channel_pullback=channel_pullback,
+        )
+        if picked is None:
+            if chart_filter_enabled:
+                result.add_report(
+                    self._heartbeat("차트 필터 - 조건 충족 종목 없음")
+                )
+            else:
+                result.add_report(self._heartbeat("매수 보류 - 조건 충족 없음"))
+            return
+
+        best, adjusted, chart_result = picked
         news_adj = news.score_adjustment if news else 0.0
-        adjusted = score + news_adj
+        adjusted = adjusted + news_adj
         # 부정 뉴스일 때는 점수 완화 없음 (저품질·레버리지 종목 유입 방지)
         if news and news.sentiment <= strategy_weak_market_sentiment:
             effective_min = max(0.0, min_score)
@@ -1406,16 +1956,36 @@ class AutoTradingStrategy:
         news_note = ""
         if news:
             news_note = f"뉴스심리 {news.sentiment:+.2f} 리스크 {news.risk_score:.2f}"
-        self._execute_buy(best, adjusted, market_msg, result, news_note)
+        chart_note = ""
+        if chart_filter_enabled and chart_result.reasons:
+            chart_note = f"차트 {chart_result.score:.0f}점 ({', '.join(chart_result.reasons)})"
+        if not is_scalping_mode() and is_momentum_candidate(best):
+            market_msg = f"{market_msg} / 모멘텀 ({best.flu_rt:+.2f}%, 순위 {best.prev_rank}→{best.rank})"
+        if chart_note:
+            market_msg = f"{market_msg} / {chart_note}"
+        buy_channel = (
+            "momentum"
+            if not is_scalping_mode() and is_momentum_candidate(best)
+            else "pullback"
+        )
+        market_msg = self._merge_buy_reason(buy_channel, market_msg)
+        self._execute_buy(
+            best, adjusted, market_msg, result, news_note, channel=buy_channel
+        )
 
     def _run_crash_buy_phase(
         self,
         result: AutoRunResult,
         holdings: list[HoldingView],
         news: MarketNewsContext | None = None,
+        *,
+        candidates: list[CandidateView] | None = None,
     ) -> None:
         """하락장에서 거래대금 상위 개별주 급락 구간 매수."""
         if is_scalping_mode() or not strategy_crash_buy_enabled:
+            return
+        snap = self._cycle_ctx.regime if self._cycle_ctx else None
+        if snap and not is_channel_allowed(snap, "crash"):
             return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
@@ -1437,14 +2007,15 @@ class AutoTradingStrategy:
             return
 
         held_codes = {h.code for h in holdings}
-        try:
-            rank_items = self.client.get_trade_value_rank(
-                top_n=strategy_crash_scan_rank_top
-            )
-            candidates = self._parse_candidates(rank_items)
-        except (KiwoomAPIError, requests.RequestException) as exc:
-            result.add_report(self._heartbeat(f"급락매수 순위 조회 실패 - {exc}"))
-            return
+        if candidates is None:
+            try:
+                rank_items = self.client.get_trade_value_rank(
+                    top_n=strategy_crash_scan_rank_top
+                )
+                candidates = self._parse_candidates(rank_items)
+            except (KiwoomAPIError, requests.RequestException) as exc:
+                result.add_report(self._heartbeat(f"급락매수 순위 조회 실패 - {exc}"))
+                return
 
         bearish, market_msg = is_bear_market(candidates)
         if not bearish:
@@ -1474,11 +2045,27 @@ class AutoTradingStrategy:
                 return
             eligible = filtered
 
+        loss_blocked = self._recent_loss_blocked_codes()
+        if loss_blocked:
+            eligible = [
+                (cand, score)
+                for cand, score in eligible
+                if cand.code not in loss_blocked
+            ]
+            if not eligible:
+                result.add_report(
+                    self._heartbeat("급락매수 보류 - 최근 손실 종목 차단")
+                )
+                return
+
         best, score = eligible[0]
         news_note = ""
         if news:
             news_note = f"뉴스심리 {news.sentiment:+.2f} 리스크 {news.risk_score:.2f}"
-        self._execute_crash_buy(best, score, market_msg, result, news_note)
+        detail = f"{market_msg} · 급락 {best.flu_rt:+.2f}%"
+        self._execute_crash_buy(
+            best, score, self._merge_buy_reason("crash", detail), result, news_note
+        )
 
     def _execute_crash_buy(
         self,
@@ -1489,7 +2076,7 @@ class AutoTradingStrategy:
         news_note: str = "",
     ) -> None:
         try:
-            order_qty = self._calc_order_qty(candidate.current_price)
+            order_qty = self._calc_order_qty(candidate.current_price, channel="crash")
             order = self.client.buy_market(
                 candidate.code,
                 order_qty,
@@ -1503,7 +2090,7 @@ class AutoTradingStrategy:
                 candidate.current_price,
                 entry_qty=order_qty,
             )
-            reason = f"{market_msg} · 급락 {candidate.flu_rt:+.2f}%"
+            reason = market_msg
             try:
                 self.journal.log(
                     "crash_buy_order",
@@ -1560,6 +2147,9 @@ class AutoTradingStrategy:
             return
         if not trend_auto_buy_enabled:
             return
+        snap = self._cycle_ctx.regime if self._cycle_ctx else None
+        if snap and not is_channel_allowed(snap, "trend"):
+            return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
         if news and not news.allow_buy:
@@ -1581,8 +2171,11 @@ class AutoTradingStrategy:
         if not scan.active_trends or not scan.picks:
             return
 
+        loss_blocked = self._recent_loss_blocked_codes()
         for pick in scan.picks:
             if pick.code in held:
+                continue
+            if pick.code in loss_blocked:
                 continue
             if strategy_block_leveraged_etf and is_leveraged_etf(pick.name, pick.code):
                 continue
@@ -1595,7 +2188,19 @@ class AutoTradingStrategy:
                 since = self.positions.cooldown_minutes_since_exit(pick.code)
                 if since is not None and since < cooldown_min:
                     continue
-            self._execute_trend_buy(pick, result)
+            chart = self.chart.evaluate(
+                code=pick.code,
+                current_price=pick.current_price,
+                mode="pullback",
+            )
+            if chart_filter_enabled and not chart.passed:
+                result.add_report(
+                    self._heartbeat(
+                        f"트렌드 차트 보류 - {pick.name}: {chart.reject_reason}"
+                    )
+                )
+                continue
+            self._execute_trend_buy(pick, result, chart)
             result.add_report(
                 self._heartbeat(
                     f"트렌드 매수 - {pick.name}",
@@ -1604,9 +2209,14 @@ class AutoTradingStrategy:
             )
             return
 
-    def _execute_trend_buy(self, pick: TrendPick, result: AutoRunResult) -> None:
+    def _execute_trend_buy(
+        self,
+        pick: TrendPick,
+        result: AutoRunResult,
+        chart: ChartSignalResult | None = None,
+    ) -> None:
         try:
-            order_qty = self._calc_order_qty(pick.current_price)
+            order_qty = self._calc_order_qty(pick.current_price, channel="trend")
             order = self.client.buy_market(
                 pick.code,
                 order_qty,
@@ -1620,6 +2230,11 @@ class AutoTradingStrategy:
                 pick.current_price,
                 entry_qty=order_qty,
             )
+            reason = self._merge_buy_reason(
+                "trend", f"[{pick.theme_name}] {pick.reason}"
+            )
+            if chart and chart.reasons:
+                reason += f" / 차트 {chart.score:.0f} ({', '.join(chart.reasons)})"
             try:
                 self.journal.log(
                     "trend_buy_order",
@@ -1627,7 +2242,7 @@ class AutoTradingStrategy:
                     name=pick.name,
                     qty=order_qty,
                     price=pick.current_price,
-                    reason=f"[{pick.theme_name}] {pick.reason}",
+                    reason=reason,
                     ord_no=ord_no,
                 )
             except Exception:
@@ -1637,7 +2252,7 @@ class AutoTradingStrategy:
                 f"테마: {pick.theme_name}\n"
                 f"종목: {pick.name}({pick.code})\n"
                 f"등락률: {pick.flu_rt:+.2f}% · {pick.current_price:,}원\n"
-                f"점수: {pick.score:.1f} · {pick.reason}\n"
+                f"점수: {pick.score:.1f} · {reason}\n"
                 f"수량: {order_qty}주 시장가\n"
                 f"주문번호: {ord_no}\n"
                 f"{order.get('return_msg', '')}"
@@ -1660,9 +2275,13 @@ class AutoTradingStrategy:
         market_msg: str,
         result: AutoRunResult,
         news_note: str = "",
+        *,
+        channel: str = "pullback",
     ) -> None:
         try:
-            order_qty = self._calc_order_qty(candidate.current_price)
+            order_qty = self._calc_order_qty(
+                candidate.current_price, channel=channel
+            )
             order = self.client.buy_market(
                 candidate.code,
                 order_qty,
@@ -1880,16 +2499,41 @@ class AutoTradingStrategy:
                 except (KiwoomAPIError, requests.RequestException):
                     pass
 
-            sold_count = self._run_sell_phase(result, news_ctx)
             try:
                 holdings = self._parse_holdings()
-                self._run_buy_phase(result, holdings, news_ctx)
-                holdings = self._parse_holdings()
-                self._run_crash_buy_phase(result, holdings, news_ctx)
-                holdings = self._parse_holdings()
-                self._run_trend_buy_phase(result, holdings, news_ctx)
             except (KiwoomAPIError, requests.RequestException) as exc:
-                result.add_event(f"잔고 오류: {exc}")
+                result.add_event(f"잔고 조회 실패: {exc}")
+                holdings = None
+
+            if holdings is not None:
+                sold_count = self._run_sell_phase(result, news_ctx, holdings=holdings)
+                if sold_count > 0:
+                    self._invalidate_holdings_cache()
+                    try:
+                        holdings = self._parse_holdings(force_refresh=True)
+                    except (KiwoomAPIError, requests.RequestException) as exc:
+                        result.add_event(f"잔고 오류: {exc}")
+                        holdings = []
+                try:
+                    cycle_ctx = self._resolve_cycle_context(news_ctx)
+                    if cycle_ctx.regime:
+                        result.add_report(
+                            self._heartbeat(f"국면 - {cycle_ctx.regime.message}")
+                        )
+                    if cycle_ctx.drawdown and drawdown_scale_enabled:
+                        result.add_report(
+                            self._heartbeat(f"스케일 - {cycle_ctx.drawdown.message}")
+                        )
+                    shared = cycle_ctx.candidates
+                    self._run_buy_phase(
+                        result, holdings, news_ctx, candidates=shared
+                    )
+                    self._run_crash_buy_phase(
+                        result, holdings, news_ctx, candidates=shared
+                    )
+                    self._run_trend_buy_phase(result, holdings, news_ctx)
+                except (KiwoomAPIError, requests.RequestException) as exc:
+                    result.add_event(f"잔고 오류: {exc}")
         else:
             try:
                 holdings = self._parse_holdings()

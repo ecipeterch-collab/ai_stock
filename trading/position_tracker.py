@@ -20,6 +20,7 @@ class PositionState:
     peak_profit_pct: float = 0.0
     partial_sold: bool = False
     tp_stage: int = 0  # 0: none, 1: stage1 done, 2: stage2 done
+    addon_buys: int = 0
 
     def update_peak(self, profit_pct: float) -> None:
         if profit_pct > self.peak_profit_pct:
@@ -121,6 +122,30 @@ class PositionTracker:
             peak_profit_pct=max(0.0, profit_pct),
         )
         self._positions[code] = state
+        self.save()
+        return state
+
+    def add_to_position(
+        self,
+        code: str,
+        add_qty: int,
+        add_price: int,
+        *,
+        profit_pct: float = 0.0,
+    ) -> PositionState | None:
+        """추가매수 후 평균단가·수량 갱신."""
+        code = self._norm(code)
+        state = self._positions.get(code)
+        if state is None or add_qty <= 0 or add_price <= 0:
+            return None
+        old_qty = max(state.entry_qty, 1)
+        new_qty = old_qty + add_qty
+        state.entry_price = int(
+            round((state.entry_price * old_qty + add_price * add_qty) / new_qty)
+        )
+        state.entry_qty = new_qty
+        state.addon_buys += 1
+        state.update_peak(profit_pct)
         self.save()
         return state
 

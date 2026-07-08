@@ -1,8 +1,8 @@
-# Tailscale Serve: 로컬 8080 웹 대시보드를 tailnet HTTPS로 노출
+# Tailscale Serve: 로컬 8081 웹 대시보드를 tailnet HTTPS로 노출
 # 사용: 관리자 PowerShell → .\scripts\tailscale-serve.ps1
 
 $ErrorActionPreference = "Stop"
-$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8080 }
+$Port = if ($env:WEB_PORT) { [int]$env:WEB_PORT } else { 8081 }
 
 function Test-Command($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
