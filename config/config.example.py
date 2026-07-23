@@ -47,6 +47,23 @@ chart_cache_daily_ttl_sec = 1800
 chart_cache_minute_ttl_sec = 300
 chart_eval_max_candidates = 5
 
+# 노트 기본 매매법 (MA 기울기·캔들·차트형) — 차트 필터 가점/하드게이트
+notebook_strategy_enabled = True
+notebook_require_ma_uptrend = True
+notebook_ma_slope_lookback = 3
+notebook_candle_bonus_enabled = True
+notebook_pattern_block_bearish = True
+notebook_max_bonus = 5.0
+notebook_bonus_big_bull = 2.0
+notebook_bonus_doji_reversal = 1.5
+notebook_bonus_hammer_harami = 2.0
+notebook_bonus_engulfing = 2.5
+notebook_bonus_morning_star = 3.0
+notebook_bonus_double_bottom = 2.5
+notebook_bonus_inv_head_shoulders = 2.0
+notebook_bonus_bull_flag = 2.0
+notebook_bonus_asc_triangle = 2.0
+
 default_order_qty = 1
 auto_interval_sec = 300
 auto_max_buys_per_day = 10

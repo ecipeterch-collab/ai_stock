@@ -1,4 +1,4 @@
-"""분봉·일봉 기반 매수 차트 필터 (VWAP, MA, RSI, 거래량)."""
+"""분봉·일봉 기반 매수 차트 필터 (VWAP, MA, RSI, 거래량, 노트 패턴)."""
 
 from __future__ import annotations
 
@@ -22,8 +22,11 @@ from config.config import (
     chart_vwap_tolerance_pct,
     chart_volume_breakout_ratio,
     chart_volume_pullback_max_ratio,
+    notebook_max_bonus,
+    notebook_strategy_enabled,
 )
 from kiwoom.client import KiwoomClient
+from trading.notebook_patterns import evaluate_notebook_patterns
 from trading.scoring import CandidateView, is_momentum_candidate
 
 
@@ -170,12 +173,27 @@ def evaluate_daily_trend_only(
     if ma_fast and ma_slow and ma_fast > ma_slow:
         score += 3
         reasons.append(f"{chart_ma_fast}MA>{chart_ma_slow}MA")
+
+    if notebook_strategy_enabled:
+        nb = evaluate_notebook_patterns(daily_closes=daily_closes, minute_candles=None)
+        if not nb.gate_ok:
+            return ChartSignalResult(
+                False,
+                score,
+                mode="pullback",
+                reasons=reasons + nb.reasons,
+                reject_reason=nb.gate_reject,
+            )
+        score += nb.bonus
+        reasons.extend(nb.reasons)
+
     min_daily = max(5.0, chart_min_score - 3)
     passed = score >= min_daily
+    max_score = 8.0 + (float(notebook_max_bonus) if notebook_strategy_enabled else 0.0)
     return ChartSignalResult(
         passed=passed,
         score=score,
-        max_score=8.0,
+        max_score=max_score,
         mode="pullback",
         reasons=reasons,
         reject_reason="" if passed else f"일봉점수 {score:.0f}<{min_daily:.0f}",
@@ -222,6 +240,21 @@ def evaluate_chart_signals(
     if ma_fast and ma_slow and ma_fast > ma_slow:
         score += 2
         reasons.append(f"{chart_ma_fast}MA>{chart_ma_slow}MA")
+
+    if notebook_strategy_enabled:
+        # MA 하드게이트만 선적용 (분봉 부족 시에도 노트 매수금지 반영)
+        nb_gate = evaluate_notebook_patterns(
+            daily_closes=daily_closes,
+            minute_candles=None,
+        )
+        if not nb_gate.gate_ok:
+            return ChartSignalResult(
+                False,
+                score,
+                mode=mode,
+                reasons=reasons + nb_gate.reasons,
+                reject_reason=nb_gate.gate_reject,
+            )
 
     if len(minute_candles) < 10:
         return ChartSignalResult(
@@ -336,6 +369,26 @@ def evaluate_chart_signals(
             score += 1
             reasons.append("반등시도")
 
+    if notebook_strategy_enabled:
+        nb = evaluate_notebook_patterns(
+            daily_closes=daily_closes,
+            minute_candles=minute_candles,
+        )
+        if not nb.gate_ok:
+            return ChartSignalResult(
+                False,
+                score,
+                mode=mode,
+                reasons=reasons + nb.reasons,
+                reject_reason=nb.gate_reject,
+            )
+        # MA reasons already partly present; append candle/pattern only once
+        for r in nb.reasons:
+            if r not in reasons:
+                reasons.append(r)
+        score += nb.bonus
+        max_score = 15.0 + float(notebook_max_bonus)
+
     passed = score >= chart_min_score
     return ChartSignalResult(
         passed=passed,
@@ -370,6 +423,19 @@ def _daily_prefilter_reject(
             mode=mode,
             reject_reason=f"일봉 추세 약함 (종가≤{chart_ma_slow}MA)",
         )
+    if notebook_strategy_enabled:
+        nb = evaluate_notebook_patterns(
+            daily_closes=daily_closes,
+            minute_candles=None,
+        )
+        if not nb.gate_ok:
+            return ChartSignalResult(
+                False,
+                0,
+                mode=mode,
+                reasons=nb.reasons,
+                reject_reason=nb.gate_reject,
+            )
     return None
 
 
