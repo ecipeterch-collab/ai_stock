@@ -45,6 +45,7 @@ from config.config import (
     news_override_disable_buy_block,
     news_override_disable_defensive_mode,
     news_override_max_risk_score,
+    strategy_block_etf,
     strategy_block_leveraged_etf,
     strategy_defensive_min_hold_minutes,
     strategy_defensive_trailing_min_peak_pct,
@@ -110,6 +111,7 @@ from config.config import (
     trend_auto_buy_enabled,
     regime_enabled,
     drawdown_scale_enabled,
+    drawdown_scale_max_mult,
     regime_scan_top,
     drawdown_benchmark_code,
 )
@@ -133,7 +135,7 @@ from trading.scoring import (
     market_bullish_stats,
     qualifies_for_position_addon,
 )
-from trading.symbol_filters import is_leveraged_etf
+from trading.symbol_filters import is_etf, is_leveraged_etf
 from trading.runtime_config import (
     effective_auto_interval_sec,
     effective_buy_windows,
@@ -764,11 +766,20 @@ class AutoTradingStrategy:
                 )
             )
             + "\n\n"
-            "■ 매수 (눌림·완만상승)\n"
+            "■ 매수 (모멘텀·차트 집중)\n"
             f"  · 거래대금 상위 {strategy_scan_rank_top} · 점수 ≥{strategy_min_score}\n"
             f"  · 등락 {strategy_min_flu_rt}~{strategy_max_flu_rt}%\n"
             f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
             f"손실 종목 {strategy_loser_reentry_cooldown_hours:.0f}h 차단\n"
+            + (
+                "  · ETF/ETN 자동매수 제외\n"
+                if strategy_block_etf
+                else (
+                    "  · 레버리지/인버스 ETF 제외\n"
+                    if strategy_block_leveraged_etf
+                    else ""
+                )
+            )
             + (
                 f"  · 시간: {ms}~{me} (오후 매수 없음)\n"
                 if as_ == ae
@@ -793,7 +804,11 @@ class AutoTradingStrategy:
                 if position_sizing_enabled
                 else ""
             )
-            + "■ 트렌드: 핫테마 연관 눌림목\n"
+            + (
+                "■ 트렌드 자동매수: OFF (수동 /trend buy)\n"
+                if not trend_auto_buy_enabled
+                else "■ 트렌드: 핫테마 연관 눌림목\n"
+            )
             + (
                 f"■ 급락 우량주: 하락장 · 상위 {strategy_crash_max_rank}위 · "
                 f"{strategy_crash_min_flu_rt}~{strategy_crash_max_flu_rt}% · "
@@ -803,8 +818,8 @@ class AutoTradingStrategy:
             )
             + "■ 연속손실 브레이커: 3회→60분 / 5회→당일중지\n"
             + (
-                "■ 국면감지: 강세(모멘텀·눌림·트렌드) / "
-                "횡보(눌림·트렌드) / 약세·고변동(급락)\n"
+                "■ 국면감지: 강세(모멘텀·추가) / 횡보(추가만) / "
+                "약세(급락·추가) / 고변동(모멘텀·급락·추가)\n"
                 if regime_enabled
                 else ""
             )
@@ -2177,7 +2192,13 @@ class AutoTradingStrategy:
                 continue
             if pick.code in loss_blocked:
                 continue
-            if strategy_block_leveraged_etf and is_leveraged_etf(pick.name, pick.code):
+            if strategy_block_etf and is_etf(pick.name, pick.code):
+                continue
+            if (
+                not strategy_block_etf
+                and strategy_block_leveraged_etf
+                and is_leveraged_etf(pick.name, pick.code)
+            ):
                 continue
             cooldown_min = (
                 scalping_reentry_cooldown_minutes

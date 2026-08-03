@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from config.config import (
+    strategy_block_etf,
     strategy_block_leveraged_etf,
     strategy_max_flu_rt,
     strategy_min_bullish_count,
@@ -15,7 +16,7 @@ from config.config import (
     strategy_optimal_flu_rt,
     strategy_scan_rank_top,
 )
-from trading.symbol_filters import is_leveraged_etf
+from trading.symbol_filters import is_etf, is_leveraged_etf
 
 
 @dataclass
@@ -146,7 +147,14 @@ def filter_and_rank_candidates(
         if cand.code in held_codes:
             rejected.append(f"{cand.name}: 보유 중")
             continue
-        if strategy_block_leveraged_etf and is_leveraged_etf(cand.name, cand.code):
+        if strategy_block_etf and is_etf(cand.name, cand.code):
+            rejected.append(f"{cand.name}: ETF 제외")
+            continue
+        if (
+            not strategy_block_etf
+            and strategy_block_leveraged_etf
+            and is_leveraged_etf(cand.name, cand.code)
+        ):
             rejected.append(f"{cand.name}: 레버리지/인버스 ETF 제외")
             continue
 

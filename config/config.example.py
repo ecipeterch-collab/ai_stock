@@ -129,7 +129,8 @@ strategy_min_rank_improve = 1
 strategy_min_bullish_count = 8
 strategy_weak_market_sentiment = -0.50
 strategy_weak_market_min_bullish_count = 3
-strategy_block_leveraged_etf = True
+strategy_block_etf = True  # KODEX/TIGER 등 일반 ETF·ETN 전체 자동매수 제외
+strategy_block_leveraged_etf = True  # block_etf=False 일 때만 레버리지/인버스만 제외
 strategy_defensive_min_hold_minutes = 45
 strategy_defensive_trailing_min_peak_pct = 3.0
 strategy_reentry_cooldown_minutes = 45
@@ -152,7 +153,7 @@ strategy_circuit_max_losses = 4
 strategy_circuit_consecutive_losses = 3
 strategy_circuit_cooldown_minutes = 60
 strategy_circuit_stop_for_day_consecutive_losses = 5
-# 매수 시간: 09:30~10:00 모멘텀, 10:00~14:00 눌림/트렌드
+# 매수 시간: 09:30~10:00 모멘텀, 10:00~14:00 국면 허용 채널만 (횡보는 신규매수 없음)
 strategy_buy_morning_start = "09:30"
 strategy_buy_morning_end = "10:00"
 strategy_buy_afternoon_start = "10:00"
@@ -194,10 +195,11 @@ regime_bull_min_bullish_ratio = 0.50
 regime_bear_max_bullish_ratio = 0.30
 regime_high_vol_min_avg_abs_flu_rt = 2.5
 regime_high_vol_min_news_risk = 0.65
-regime_bull_channels = ("momentum", "pullback", "trend", "addon")
-regime_sideways_channels = ("pullback", "trend", "addon")
+# 모멘텀·차트 집중: 눌림/트렌드 공회전(횡보·고변동) 축소
+regime_bull_channels = ("momentum", "addon")
+regime_sideways_channels = ("addon",)  # 횡보: 신규매수 없음, 추가매수만
 regime_bear_channels = ("crash", "addon")
-regime_high_vol_channels = ("pullback", "crash", "addon")
+regime_high_vol_channels = ("momentum", "crash", "addon")  # 눌림 제거
 
 # 드로다운 스케일 매수 — 벤치마크 MDD에 따른 포지션 배수
 drawdown_scale_enabled = True
@@ -211,7 +213,7 @@ drawdown_scale_tier2_mult = 1.25
 drawdown_scale_tier3_mult = 1.5
 drawdown_scale_tier4_mult = 2.0
 drawdown_scale_max_mult = 2.5
-drawdown_scale_channel_boost = ("crash", "pullback", "trend")
+drawdown_scale_channel_boost = ("crash",)
 drawdown_scale_momentum_mult_cap = 1.0
 
 notify_on_auto_events_only = True
@@ -224,7 +226,7 @@ web_token_expire_hours = 24
 web_tunnel_enabled = True
 web_tunnel_provider = "cloudflared"  # cloudflared | ngrok
 
-trend_auto_buy_enabled = True
+trend_auto_buy_enabled = False  # 트렌드 채널 공회전 방지 (모멘텀·차트 집중)
 trend_min_theme_hits = 2
 trend_dip_min_flu_rt = -5.0
 trend_dip_max_flu_rt = 3.0
