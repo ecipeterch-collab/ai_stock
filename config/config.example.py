@@ -46,6 +46,9 @@ chart_volume_pullback_max_ratio = 0.7
 chart_cache_daily_ttl_sec = 1800
 chart_cache_minute_ttl_sec = 300
 chart_eval_max_candidates = 5
+# 차트 우선 매수: 국면·등락·점수·뉴스는 참고/알림, 차트 통과가 매수 본결정
+chart_primary_mode = True
+chart_primary_eval_max_candidates = 10
 
 # 노트 기본 매매법 (MA 기울기·캔들·차트형) — 차트 필터 가점/하드게이트
 notebook_strategy_enabled = True
@@ -182,11 +185,15 @@ news_score_penalty_negative = -4.0
 news_defensive_loss_pct = -0.5
 
 news_override_when_market_bullish = True
-news_override_max_risk_score = 0.40
+# 강세장 오버라이드는 키워드 리스크 점수와 무관 (지정학 RSS 노이즈 대응)
+news_override_max_risk_score = 1.0
 news_override_min_bullish_ratio = 0.25
 news_override_allow_buy_sentiment_floor = -0.75
 news_override_disable_defensive_mode = True
 news_override_disable_buy_block = True
+# 뉴스 필터 차순위: 기술 신호 우선, 뉴스는 점수 페널티·극단 차단만
+news_filter_secondary = True
+news_secondary_extra_penalty = -6.0
 
 # 시장 국면 감지 — 채널별 매수 on/off (trading/market_regime.py)
 regime_enabled = True

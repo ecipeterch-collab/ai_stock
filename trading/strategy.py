@@ -10,6 +10,9 @@ import requests
 from config.config import (
     chart_filter_enabled,
     chart_eval_max_candidates,
+    chart_primary_mode,
+    chart_primary_eval_max_candidates,
+    chart_min_score,
     default_order_qty,
     position_sizing_enabled,
     position_target_krw,
@@ -39,12 +42,9 @@ from config.config import (
     top_volume_rank_n,
     news_defensive_loss_pct,
     news_enabled,
-    news_override_allow_buy_sentiment_floor,
+    news_filter_secondary,
     news_override_min_bullish_ratio,
     news_override_when_market_bullish,
-    news_override_disable_buy_block,
-    news_override_disable_defensive_mode,
-    news_override_max_risk_score,
     strategy_block_etf,
     strategy_block_leveraged_etf,
     strategy_defensive_min_hold_minutes,
@@ -127,6 +127,13 @@ from trading.journal_stats import build_daily_summary, format_daily_summary_text
 from trading.account_pnl import build_account_summary, format_account_summary_text
 from trading.position_tracker import PositionState, PositionTracker
 from trading.news_analyzer import MarketNewsAnalyzer, MarketNewsContext
+from trading.news_priority import apply_bullish_news_override, news_score_gate
+from trading.chart_primary import (
+    advisory_market_note,
+    advisory_strategy_score,
+    build_buy_advisory_notes,
+    filter_chart_primary_universe,
+)
 from trading.scoring import (
     CandidateView,
     filter_and_rank_candidates,
@@ -290,6 +297,38 @@ class AutoTradingStrategy:
             total = score + self.chart.chart_score_bonus(chart)
             if best is None or total > best[1]:
                 best = (cand, total, chart)
+        return best
+
+    def _pick_chart_primary(
+        self,
+        universe: list[CandidateView],
+    ) -> tuple[CandidateView, float, ChartSignalResult, bool] | None:
+        """차트 우선: 등락/국면 무관하게 차트 통과 종목 중 최고점 선택.
+
+        Returns:
+            (candidate, total_score, chart_result, used_momentum)
+        """
+        limit = max(
+            1,
+            int(chart_primary_eval_max_candidates or chart_eval_max_candidates),
+        )
+        pool = universe[:limit]
+        if not pool:
+            return None
+        if chart_filter_enabled:
+            self.chart.prefetch_daily([cand.code for cand in pool])
+
+        best: tuple[CandidateView, float, ChartSignalResult, bool] | None = None
+        for cand in pool:
+            # 눌림·모멘텀 차트 모드 모두 시도 후 더 좋은 통과 결과 채택
+            for momentum in (False, True):
+                chart = self.chart.evaluate_candidate(cand, momentum=momentum)
+                if not chart.passed:
+                    continue
+                base = advisory_strategy_score(cand, momentum=momentum)
+                total = base + self.chart.chart_score_bonus(chart)
+                if best is None or total > best[1]:
+                    best = (cand, total, chart, momentum)
         return best
 
     def enable(self) -> None:
@@ -766,18 +805,28 @@ class AutoTradingStrategy:
                 )
             )
             + "\n\n"
-            "■ 매수 (모멘텀·차트 집중)\n"
-            f"  · 거래대금 상위 {strategy_scan_rank_top} · 점수 ≥{strategy_min_score}\n"
-            f"  · 등락 {strategy_min_flu_rt}~{strategy_max_flu_rt}%\n"
-            f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
-            f"손실 종목 {strategy_loser_reentry_cooldown_hours:.0f}h 차단\n"
             + (
-                "  · ETF/ETN 자동매수 제외\n"
-                if strategy_block_etf
+                "■ 매수 (차트 우선)\n"
+                f"  · 거래대금 상위 {strategy_scan_rank_top} → 차트 ≥{chart_min_score:.0f}점이 본결정\n"
+                f"  · 차트 평가 상위 {chart_primary_eval_max_candidates}종목 (눌림·모멘텀 모드)\n"
+                "  · 국면·강세·등락·전략점수·뉴스 = 참고/알림만\n"
+                "  · ETF/ETN 제외 · 보유 중 제외\n"
+                if chart_primary_mode
                 else (
-                    "  · 레버리지/인버스 ETF 제외\n"
-                    if strategy_block_leveraged_etf
-                    else ""
+                    "■ 매수 (모멘텀·차트 집중)\n"
+                    f"  · 거래대금 상위 {strategy_scan_rank_top} · 점수 ≥{strategy_min_score}\n"
+                    f"  · 등락 {strategy_min_flu_rt}~{strategy_max_flu_rt}%\n"
+                    f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
+                    f"손실 종목 {strategy_loser_reentry_cooldown_hours:.0f}h 차단\n"
+                    + (
+                        "  · ETF/ETN 자동매수 제외\n"
+                        if strategy_block_etf
+                        else (
+                            "  · 레버리지/인버스 ETF 제외\n"
+                            if strategy_block_leveraged_etf
+                            else ""
+                        )
+                    )
                 )
             )
             + (
@@ -786,10 +835,14 @@ class AutoTradingStrategy:
                 else f"  · 시간: {ms}~{me}, {as_}~{ae}\n"
             )
             + (
-                f"  · 모멘텀 채널: ~{strategy_momentum_window_end} "
-                "상승 중·순위 급등 허용\n"
-                if strategy_momentum_buy_enabled
-                else "\n"
+                f"  · 모멘텀 차트모드: ~{strategy_momentum_window_end} 참고\n"
+                if chart_primary_mode and strategy_momentum_buy_enabled
+                else (
+                    f"  · 모멘텀 채널: ~{strategy_momentum_window_end} "
+                    "상승 중·순위 급등 허용\n"
+                    if strategy_momentum_buy_enabled
+                    else "\n"
+                )
             )
             + (
                 f"  · 추가매수: 진입가 -{position_addon_min_drop_pct:.1f}%↓ · "
@@ -818,10 +871,14 @@ class AutoTradingStrategy:
             )
             + "■ 연속손실 브레이커: 3회→60분 / 5회→당일중지\n"
             + (
-                "■ 국면감지: 강세(모멘텀·추가) / 횡보(추가만) / "
-                "약세(급락·추가) / 고변동(모멘텀·급락·추가)\n"
-                if regime_enabled
-                else ""
+                "■ 국면감지: 참고/알림 (매수 하드게이트 아님)\n"
+                if chart_primary_mode and regime_enabled
+                else (
+                    "■ 국면감지: 강세(모멘텀·추가) / 횡보(추가만) / "
+                    "약세(급락·추가) / 고변동(모멘텀·급락·추가)\n"
+                    if regime_enabled
+                    else ""
+                )
             )
             + (
                 f"■ 드로다운스케일: {drawdown_benchmark_code} MDD 구간별 "
@@ -1613,7 +1670,8 @@ class AutoTradingStrategy:
             return
         snap = self._cycle_ctx.regime if self._cycle_ctx else None
         if snap and not is_channel_allowed(snap, "addon"):
-            return
+            if not chart_primary_mode:
+                return
 
         loss_blocked = self._recent_loss_blocked_codes()
         by_code = {c.code: c for c in candidates}
@@ -1758,7 +1816,12 @@ class AutoTradingStrategy:
         channel_pullback = is_channel_allowed(snap, "pullback")
         channel_momentum = is_channel_allowed(snap, "momentum")
 
-        if news and not news.allow_buy:
+        # 뉴스 1순위 하드게이트는 레거시 모드에서만. 차순위는 점수 단계에서 반영.
+        if (
+            news
+            and not news.allow_buy
+            and not news_filter_secondary
+        ):
             result.add_report(
                 self._heartbeat(
                     "뉴스 필터 - 신규매수 중단 "
@@ -1805,6 +1868,30 @@ class AutoTradingStrategy:
         if position_addon_enabled and not is_scalping_mode():
             self._try_addon_buys(result, holdings, candidates)
 
+        max_pos = effective_max_positions()
+        if len(holdings) >= max_pos:
+            result.add_report(
+                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
+            )
+            return
+
+        heat = self._portfolio_heat_blocks_buy(holdings)
+        if heat:
+            result.add_report(self._heartbeat(heat))
+            return
+
+        # 차트 우선: 국면·강세·등락·점수·뉴스는 참고만, 차트가 매수 본결정
+        if chart_primary_mode and not is_scalping_mode():
+            self._run_chart_primary_buy(
+                result,
+                holdings,
+                news,
+                candidates=candidates,
+                held_codes=held_codes,
+                snap=snap,
+            )
+            return
+
         if is_scalping_mode():
             if not channel_pullback:
                 result.add_report(
@@ -1827,18 +1914,6 @@ class AutoTradingStrategy:
                     )
                 )
                 return
-
-        max_pos = effective_max_positions()
-        if len(holdings) >= max_pos:
-            result.add_report(
-                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
-            )
-            return
-
-        heat = self._portfolio_heat_blocks_buy(holdings)
-        if heat:
-            result.add_report(self._heartbeat(heat))
-            return
 
         min_score = scalping_min_score if is_scalping_mode() else strategy_min_score
 
@@ -1953,24 +2028,33 @@ class AutoTradingStrategy:
             return
 
         best, adjusted, chart_result = picked
-        news_adj = news.score_adjustment if news else 0.0
-        adjusted = adjusted + news_adj
+        hard_stop, adjusted, news_gate_note = news_score_gate(
+            base_score=adjusted,
+            news=news,
+            min_score=min_score,
+        )
+        if hard_stop:
+            result.add_report(self._heartbeat(news_gate_note or "뉴스 극단 부정 중단"))
+            return
         # 부정 뉴스일 때는 점수 완화 없음 (저품질·레버리지 종목 유입 방지)
         if news and news.sentiment <= strategy_weak_market_sentiment:
             effective_min = max(0.0, min_score)
         else:
             effective_min = max(0.0, min_score - 3.0)
         if adjusted < effective_min:
-            result.add_report(
-                self._heartbeat(
-                    f"점수 부족 - {best.name} {adjusted:.1f} < {effective_min:.1f}점"
-                )
+            detail = (
+                f"점수 부족 - {best.name} {adjusted:.1f} < {effective_min:.1f}점"
             )
+            if news_gate_note:
+                detail = f"{detail} ({news_gate_note})"
+            result.add_report(self._heartbeat(detail))
             return
 
         news_note = ""
         if news:
             news_note = f"뉴스심리 {news.sentiment:+.2f} 리스크 {news.risk_score:.2f}"
+            if news_gate_note:
+                news_note = f"{news_note} · {news_gate_note}"
         chart_note = ""
         if chart_filter_enabled and chart_result.reasons:
             chart_note = f"차트 {chart_result.score:.0f}점 ({', '.join(chart_result.reasons)})"
@@ -1986,6 +2070,87 @@ class AutoTradingStrategy:
         market_msg = self._merge_buy_reason(buy_channel, market_msg)
         self._execute_buy(
             best, adjusted, market_msg, result, news_note, channel=buy_channel
+        )
+
+    def _run_chart_primary_buy(
+        self,
+        result: AutoRunResult,
+        holdings: list[HoldingView],
+        news: MarketNewsContext | None,
+        *,
+        candidates: list[CandidateView],
+        held_codes: set[str],
+        snap,
+    ) -> None:
+        """차트 우선 매수: 차트 통과가 본결정, 나머지는 참고 메모."""
+        self.chart.prune_stale_cache()
+        universe, rejected = filter_chart_primary_universe(
+            candidates,
+            held_codes,
+            block_etf=strategy_block_etf,
+            block_leveraged_etf=strategy_block_leveraged_etf,
+        )
+        if not universe:
+            detail = rejected[0] if rejected else "후보 없음"
+            result.add_report(self._heartbeat(f"차트우선 - {detail}"))
+            return
+
+        market_note = advisory_market_note(candidates)
+        regime_note = ""
+        if snap is not None:
+            regime_note = getattr(snap, "message", "") or getattr(snap, "label", "")
+        news_msg = ""
+        if news:
+            news_msg = f"심리 {news.sentiment:+.2f}, 리스크 {news.risk_score:.2f}"
+
+        result.add_report(
+            self._heartbeat(
+                f"차트우선 점검 (후보 {len(universe)} · {market_note}"
+                + (f" · {regime_note}" if regime_note else "")
+                + ")"
+            )
+        )
+
+        picked = self._pick_chart_primary(universe)
+        if picked is None:
+            result.add_report(
+                self._heartbeat(
+                    f"차트 미통과 - 평가 {min(len(universe), int(chart_primary_eval_max_candidates))}종목"
+                )
+            )
+            return
+
+        best, adjusted, chart_result, used_momentum = picked
+        _, adjusted, news_gate_note = news_score_gate(
+            base_score=adjusted,
+            news=news,
+            min_score=0.0,
+        )
+        strat_score = advisory_strategy_score(best, momentum=used_momentum)
+        advisory = build_buy_advisory_notes(
+            candidate=best,
+            market_msg=market_note,
+            regime_msg=regime_note,
+            news_msg=news_msg,
+            strategy_score=strat_score,
+            strategy_min_score=float(strategy_min_score),
+        )
+        chart_note = (
+            f"차트 {chart_result.score:.0f}점"
+            f" (≥{chart_min_score:.0f}, {', '.join(chart_result.reasons) or '통과'})"
+        )
+        buy_channel = "momentum" if used_momentum else "pullback"
+        reason = self._merge_buy_reason(
+            buy_channel,
+            f"{chart_note} · {advisory}",
+        )
+        if news_gate_note:
+            reason = f"{reason} · {news_gate_note}"
+        news_note = news_msg
+        if news_gate_note:
+            news_note = f"{news_note} · {news_gate_note}".strip(" ·")
+        self._execute_buy(
+            best, adjusted, reason, result, news_note, channel=buy_channel
         )
 
     def _run_crash_buy_phase(
@@ -2004,7 +2169,7 @@ class AutoTradingStrategy:
             return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
-        if news and not news.allow_buy:
+        if news and not news.allow_buy and not news_filter_secondary and not chart_primary_mode:
             return
         if news and news.risk_score >= strategy_crash_max_news_risk:
             return
@@ -2167,7 +2332,7 @@ class AutoTradingStrategy:
             return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
-        if news and not news.allow_buy:
+        if news and not news.allow_buy and not news_filter_secondary and not chart_primary_mode:
             return
         if not self._can_trend_buy_today():
             return
@@ -2470,6 +2635,7 @@ class AutoTradingStrategy:
 
         if is_market_open():
             # 시장이 강세일 때는 뉴스로 인한 신규매수 중단/방어모드를 완화
+            # (키워드 리스크 점수와 무관 — 지정학 RSS 노이즈 대응)
             if news_override_when_market_bullish and news_enabled:
                 try:
                     scan_top = (
@@ -2492,31 +2658,12 @@ class AutoTradingStrategy:
                             and bull_total > 0
                             and bull_ratio >= news_override_min_bullish_ratio
                         )
-                    if (
-                        strong_market
-                        and news_ctx.risk_score < news_override_max_risk_score
-                    ):
-                        changed = False
-                        notes: list[str] = []
-                        if (
-                            news_override_disable_buy_block
-                            and not news_ctx.allow_buy
-                            and news_ctx.sentiment
-                            >= news_override_allow_buy_sentiment_floor
-                        ):
-                            news_ctx.allow_buy = True
-                            changed = True
-                            notes.append("신규매수 중단 OFF")
-                        if (
-                            news_override_disable_defensive_mode
-                            and news_ctx.defensive_mode
-                        ):
-                            news_ctx.defensive_mode = False
-                            changed = True
-                            notes.append("방어모드 OFF")
-                        if changed:
-                            note = "강세장 감지 → 뉴스 override (" + ", ".join(notes) + ")"
-                            news_ctx.error = f"{news_ctx.error} | {note}".strip(" |")
+                    changed, notes = apply_bullish_news_override(
+                        news_ctx, strong_market=strong_market
+                    )
+                    if changed:
+                        note = "강세장 감지 → 뉴스 override (" + ", ".join(notes) + ")"
+                        news_ctx.error = f"{news_ctx.error} | {note}".strip(" |")
                 except (KiwoomAPIError, requests.RequestException):
                     pass
 
