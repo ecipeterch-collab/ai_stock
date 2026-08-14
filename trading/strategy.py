@@ -13,6 +13,18 @@ from config.config import (
     chart_primary_mode,
     chart_primary_eval_max_candidates,
     chart_min_score,
+    strategy_chart_primary_max_flu_rt,
+    orb_enabled,
+    orb_range_start,
+    orb_range_end,
+    orb_trade_end,
+    orb_volume_breakout_ratio,
+    orb_require_above_vwap,
+    orb_min_range_pct,
+    orb_max_range_pct,
+    orb_score_bonus,
+    orb_wait_for_range,
+    orb_morning_momentum_only,
     default_order_qty,
     position_sizing_enabled,
     position_target_krw,
@@ -28,6 +40,11 @@ from config.config import (
     strategy_swing_breakeven_floor_pct,
     strategy_swing_protect_trailing_activate_pct,
     strategy_swing_protect_trailing_drawdown_pct,
+    strategy_swing_be_remainder_drawdown_pct,
+    strategy_swing_exit_confirm_cycles,
+    strategy_swing_exit_vol_lookback,
+    strategy_swing_exit_vol_light_ratio,
+    strategy_swing_exit_vol_heavy_ratio,
     strategy_swing_stagnation_minutes,
     strategy_swing_stagnation_max_profit_pct,
     strategy_loser_reentry_cooldown_hours,
@@ -96,6 +113,7 @@ from config.config import (
     strategy_trend_max_buys_per_day,
     strategy_breakeven_activate_pct,
     strategy_breakeven_floor_pct,
+    strategy_eod_cut_loss_enabled,
     strategy_eod_sell_enabled,
     strategy_min_flu_rt,
     strategy_max_flu_rt,
@@ -132,6 +150,7 @@ from trading.chart_primary import (
     advisory_market_note,
     advisory_strategy_score,
     build_buy_advisory_notes,
+    chart_primary_channel_flags,
     filter_chart_primary_universe,
 )
 from trading.scoring import (
@@ -153,10 +172,20 @@ from trading.runtime_config import (
     is_scalping_mode,
     mode_label,
 )
-from trading.chart_signals import ChartSignalAnalyzer, ChartSignalResult
+from trading.chart_signals import (
+    ChartSignalAnalyzer,
+    ChartSignalResult,
+    classify_exit_volume,
+    latest_vs_avg_volume_ratio,
+)
 from trading.crash_buy import (
     filter_crash_candidates,
     is_bear_market,
+)
+from trading.orb import (
+    evaluate_orb_breakout,
+    is_orb_range_forming,
+    is_orb_trade_window,
 )
 from trading.market_regime import (
     MarketContext,
@@ -299,15 +328,31 @@ class AutoTradingStrategy:
                 best = (cand, total, chart)
         return best
 
+    def _in_morning_buy_window(self, now: datetime | None = None) -> bool:
+        current = now or datetime.now()
+        ms, me, _, _ = effective_buy_windows()
+        t = current.time()
+        return parse_hhmm(ms) <= t < parse_hhmm(me)
+
     def _pick_chart_primary(
         self,
         universe: list[CandidateView],
+        *,
+        allow_momentum: bool = True,
+        allow_pullback: bool = True,
     ) -> tuple[CandidateView, float, ChartSignalResult, bool] | None:
-        """차트 우선: 등락/국면 무관하게 차트 통과 종목 중 최고점 선택.
+        """차트 우선: 허용된 차트 모드만 시도해 최고점 선택.
 
         Returns:
             (candidate, total_score, chart_result, used_momentum)
         """
+        modes: list[bool] = []
+        if allow_pullback:
+            modes.append(False)
+        if allow_momentum:
+            modes.append(True)
+        if not modes:
+            return None
         limit = max(
             1,
             int(chart_primary_eval_max_candidates or chart_eval_max_candidates),
@@ -320,8 +365,7 @@ class AutoTradingStrategy:
 
         best: tuple[CandidateView, float, ChartSignalResult, bool] | None = None
         for cand in pool:
-            # 눌림·모멘텀 차트 모드 모두 시도 후 더 좋은 통과 결과 채택
-            for momentum in (False, True):
+            for momentum in modes:
                 chart = self.chart.evaluate_candidate(cand, momentum=momentum)
                 if not chart.passed:
                     continue
@@ -330,6 +374,88 @@ class AutoTradingStrategy:
                 if best is None or total > best[1]:
                     best = (cand, total, chart, momentum)
         return best
+
+    def _apply_orb_morning_filter(
+        self,
+        eligible: list[tuple[CandidateView, float]],
+        result: AutoRunResult,
+    ) -> list[tuple[CandidateView, float]] | None:
+        """아침 ORB 창: 돌파 종목 우선, 미통과 시 눌림/일반매수로 fall-through.
+
+        Returns:
+            ORB 통과 후보, fall-through 시 원본 eligible,
+            시초 레인지 형성 중(대기)일 때만 None.
+        """
+        if is_scalping_mode() or not orb_enabled:
+            return eligible
+        now = datetime.now()
+        if is_orb_range_forming(
+            now, range_start=orb_range_start, range_end=orb_range_end
+        ):
+            if orb_wait_for_range:
+                result.add_report(
+                    self._heartbeat(
+                        f"ORB 시초구간 형성 중 ({orb_range_start}~{orb_range_end})"
+                    )
+                )
+                return None
+            return eligible
+        if not is_orb_trade_window(
+            now, range_end=orb_range_end, trade_end=orb_trade_end
+        ):
+            return eligible
+
+        pool = eligible
+        if orb_morning_momentum_only:
+            pool = [
+                (cand, score)
+                for cand, score in eligible
+                if is_momentum_candidate(cand)
+            ]
+            if not pool:
+                result.add_report(
+                    self._heartbeat(
+                        "ORB 미통과 - 모멘텀 후보 없음 · 눌림/일반매수 계속"
+                    )
+                )
+                return eligible
+
+        passed: list[tuple[CandidateView, float]] = []
+        rejects: list[str] = []
+        for cand, score in pool[: max(1, int(chart_eval_max_candidates))]:
+            try:
+                minutes = self.chart.load_minute_candles(cand.code)
+            except (KiwoomAPIError, requests.RequestException) as exc:
+                rejects.append(f"{cand.name}: 분봉실패 {exc}")
+                continue
+            check = evaluate_orb_breakout(
+                minutes,
+                current_price=cand.current_price,
+                now=now,
+                range_start=orb_range_start,
+                range_end=orb_range_end,
+                trade_end=orb_trade_end,
+                volume_breakout_ratio=orb_volume_breakout_ratio,
+                require_above_vwap=orb_require_above_vwap,
+                min_range_pct=orb_min_range_pct,
+                max_range_pct=orb_max_range_pct,
+                score_bonus=orb_score_bonus,
+            )
+            if not check.passed:
+                rejects.append(f"{cand.name}: {check.reason}")
+                continue
+            passed.append((cand, score + check.bonus))
+
+        if not passed:
+            detail = rejects[0] if rejects else "ORB 돌파 없음"
+            result.add_report(
+                self._heartbeat(f"ORB 미통과 - {detail} · 눌림/일반매수 계속")
+            )
+            return eligible
+        result.add_report(
+            self._heartbeat(f"ORB 통과 {len(passed)}종목 (시초 {orb_range_end} 돌파)")
+        )
+        return passed
 
     def enable(self) -> None:
         self.enabled = True
@@ -790,11 +916,33 @@ class AutoTradingStrategy:
             f"+{strategy_swing_top_volume_tp2_pct}% 총 80%\n"
             f"  · 부분익절 후 트레일링: 고점 +{strategy_swing_trailing_activate_pct}% "
             f"→ -{strategy_swing_trailing_drawdown_pct}%p\n"
+            f"  · 본전스탑: 고점 +{strategy_swing_breakeven_activate_pct}% 후 "
+            f"+{strategy_swing_breakeven_floor_pct}% 미만이면 50%(1주는 전량), "
+            f"잔량은 고점-{strategy_swing_be_remainder_drawdown_pct}%p(바닥 0%) 트레일 · "
+            f"{strategy_swing_exit_confirm_cycles}회 확인 · "
+            f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
+            f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
+            f"  · 수익보호 트레일: 고점 +{strategy_swing_protect_trailing_activate_pct}% "
+            f"→ -{strategy_swing_protect_trailing_drawdown_pct}%p · "
+            f"{strategy_swing_exit_confirm_cycles}회 확인 · "
+            f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
+            f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
             f"  · 손절: -{strategy_stop_loss_pct}% · 청산: "
             f"{'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
-            f"  · 정체 청산: {strategy_swing_stagnation_minutes}분+ 보유 & "
-            f"+{strategy_swing_stagnation_max_profit_pct:.1f}% 미만\n"
-            f"  · 장마감: {cut} 손실 정리"
+            + (
+                "  · 정체 청산: 비활성\n"
+                if int(strategy_swing_stagnation_minutes) <= 0
+                else (
+                    f"  · 정체 청산: {strategy_swing_stagnation_minutes}분+ 보유 & "
+                    f"+{strategy_swing_stagnation_max_profit_pct:.1f}% 미만\n"
+                )
+            )
+            + f"  · 장마감: "
+            + (
+                f"{cut} 손실 정리"
+                if strategy_eod_cut_loss_enabled
+                else "손실 강제청산 없음"
+            )
             + (
                 f" · {eod} 전량"
                 if strategy_swing_eod_sell_all
@@ -808,16 +956,26 @@ class AutoTradingStrategy:
             + (
                 "■ 매수 (차트 우선)\n"
                 f"  · 거래대금 상위 {strategy_scan_rank_top} → 차트 ≥{chart_min_score:.0f}점이 본결정\n"
-                f"  · 차트 평가 상위 {chart_primary_eval_max_candidates}종목 (눌림·모멘텀 모드)\n"
-                "  · 국면·강세·등락·전략점수·뉴스 = 참고/알림만\n"
+                f"  · 차트 평가 상위 {chart_primary_eval_max_candidates}종목 "
+                f"(오전 모멘텀·이후 눌림)\n"
+                f"  · 등락 +{strategy_chart_primary_max_flu_rt:.0f}% 초과 금지 · "
+                "고변동 오후 신규 차트매수 없음\n"
+                "  · 전략점수·뉴스는 참고/알림\n"
                 "  · ETF/ETN 제외 · 보유 중 제외\n"
                 if chart_primary_mode
                 else (
-                    "■ 매수 (모멘텀·차트 집중)\n"
+                    "■ 매수 (모멘텀·ORB 우선)\n"
                     f"  · 거래대금 상위 {strategy_scan_rank_top} · 점수 ≥{strategy_min_score}\n"
                     f"  · 등락 {strategy_min_flu_rt}~{strategy_max_flu_rt}%\n"
                     f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
                     f"손실 종목 {strategy_loser_reentry_cooldown_hours:.0f}h 차단\n"
+                    + (
+                        f"  · ORB: 시초 {orb_range_start}~{orb_range_end} 고가 돌파"
+                        f" · 거래량×{orb_volume_breakout_ratio:.1f}"
+                        f" · ~{orb_trade_end}\n"
+                        if orb_enabled
+                        else ""
+                    )
                     + (
                         "  · ETF/ETN 자동매수 제외\n"
                         if strategy_block_etf
@@ -874,7 +1032,7 @@ class AutoTradingStrategy:
                 "■ 국면감지: 참고/알림 (매수 하드게이트 아님)\n"
                 if chart_primary_mode and regime_enabled
                 else (
-                    "■ 국면감지: 강세(모멘텀·추가) / 횡보(추가만) / "
+                    "■ 국면감지: 강세(모멘텀·눌림·추가) / 횡보(추가만) / "
                     "약세(급락·추가) / 고변동(모멘텀·급락·추가)\n"
                     if regime_enabled
                     else ""
@@ -1253,7 +1411,7 @@ class AutoTradingStrategy:
         return candidates
 
     def _is_eod_cut_loss_time(self, now: datetime | None = None) -> bool:
-        if not strategy_eod_sell_enabled:
+        if not strategy_eod_sell_enabled or not strategy_eod_cut_loss_enabled:
             return False
         cut, _ = effective_eod_times()
         return (now or datetime.now()).time() >= parse_hhmm(cut)
@@ -1263,6 +1421,72 @@ class AutoTradingStrategy:
             return False
         _, eod = effective_eod_times()
         return (now or datetime.now()).time() >= parse_hhmm(eod)
+
+    def _exit_needs_confirm(self, reason: str) -> bool:
+        if reason.startswith("본전스탑"):
+            return True
+        return "수익보호 트레일링" in reason
+
+    def _exit_confirm_key(self, reason: str) -> str:
+        if "잔량 트레일링" in reason:
+            return "be_remainder"
+        if reason.startswith("본전스탑"):
+            return "breakeven"
+        if "수익보호 트레일링" in reason:
+            return "protect"
+        return reason
+
+    def _exit_volume_class(
+        self, code: str, reason: str | None
+    ) -> tuple[str, float | None]:
+        """본전스탑·수익보호만 분봉 거래량으로 light/normal/heavy 판정."""
+        if not reason or not self._exit_needs_confirm(reason):
+            return "normal", None
+        try:
+            candles = self.chart.load_minute_candles(code)
+        except Exception:
+            return "normal", None
+        ratio = latest_vs_avg_volume_ratio(
+            candles, lookback=int(strategy_swing_exit_vol_lookback)
+        )
+        kind = classify_exit_volume(
+            ratio,
+            light_ratio=float(strategy_swing_exit_vol_light_ratio),
+            heavy_ratio=float(strategy_swing_exit_vol_heavy_ratio),
+        )
+        return kind, ratio
+
+    def _confirm_exit_signal(
+        self,
+        code: str,
+        reason: str | None,
+        *,
+        volume_class: str = "normal",
+    ) -> str | None:
+        """본전스탑·수익보호는 연속 N회 충족해야 청산. 손절·장마감은 즉시.
+
+        거래량 light: 가짜 눌림으로 대기 카운트 리셋.
+        거래량 heavy: 매도 압력으로 즉시 청산.
+        """
+        if not reason:
+            self.positions.clear_exit_signal(code)
+            return None
+        if not self._exit_needs_confirm(reason):
+            self.positions.clear_exit_signal(code)
+            return reason
+        if volume_class == "light":
+            self.positions.clear_exit_signal(code)
+            return None
+        if volume_class == "heavy":
+            self.positions.clear_exit_signal(code)
+            return reason
+        cycles = max(1, int(strategy_swing_exit_confirm_cycles))
+        count = self.positions.note_exit_signal(
+            code, self._exit_confirm_key(reason)
+        )
+        if count >= cycles:
+            return reason
+        return None
 
     def _evaluate_sell(
         self,
@@ -1385,8 +1609,18 @@ class AutoTradingStrategy:
                 )
 
         # 수익 보호: 1주 포지션 포함 모든 보유에 적용 (부분익절 게이트 없음)
-        # 1) 일반 트레일링 — 고점이 충분히 높으면 되돌림 시 청산
-        if peak >= strategy_swing_protect_trailing_activate_pct:
+        be_scaled = bool(getattr(state, "be_scaled", False)) if state else False
+        # 본전스탑 50% 이후 잔량은 더 넓은 폭·본전(0%) 바닥으로 트레일
+        if be_scaled:
+            remainder_dd = float(strategy_swing_be_remainder_drawdown_pct)
+            protect_floor = max(0.0, peak - remainder_dd)
+            if profit < protect_floor:
+                return (
+                    f"본전스탑 잔량 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
+                    qty,
+                    None,
+                )
+        elif peak >= strategy_swing_protect_trailing_activate_pct:
             protect_floor = peak - strategy_swing_protect_trailing_drawdown_pct
             if profit < protect_floor:
                 return (
@@ -1394,15 +1628,24 @@ class AutoTradingStrategy:
                     qty,
                     None,
                 )
-        # 2) 본전스탑 — 한 번 +N% 갔다가 본전 부근으로 되돌아오면 소소익/본전 청산
-        if peak >= strategy_swing_breakeven_activate_pct and (
-            profit < strategy_swing_breakeven_floor_pct
+        # 2) 본전스탑 — 한 번 +N% 갔다가 본전 부근이면 50% (1주는 전량)
+        if (
+            not be_scaled
+            and peak >= strategy_swing_breakeven_activate_pct
+            and profit < strategy_swing_breakeven_floor_pct
         ):
-            return (
-                f"본전스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                qty,
-                None,
+            be_qty = self._calc_stage_sell_qty(
+                entry_qty, sellable, already_sold, 0.50
             )
+            if be_qty > 0:
+                label = (
+                    f"본전스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
+                    if entry_qty <= 1 or be_qty >= sellable
+                    else (
+                        f"본전스탑 50% 매도 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
+                    )
+                )
+                return label, be_qty, None
 
         if news and news.defensive_mode:
             hold_min = self.positions.holding_minutes(holding.code)
@@ -1437,6 +1680,43 @@ class AutoTradingStrategy:
 
         return None, 0, None
 
+    def _log_sell_order(
+        self,
+        holding: HoldingView,
+        sell_qty: int,
+        *,
+        price: int | None,
+        profit_pct: float | None,
+        reason: str,
+        ord_no: str,
+    ) -> None:
+        try:
+            self.journal.log(
+                "sell_order",
+                code=holding.code,
+                name=holding.name,
+                qty=sell_qty,
+                price=price,
+                profit_pct=profit_pct,
+                reason=reason,
+                ord_no=ord_no,
+            )
+        except Exception:
+            pass
+
+    def latest_fill_price(self, ord_no: str) -> int | None:
+        """최근 저널 체결가 (수동매수 등 주문가 보완)."""
+        if not ord_no:
+            return None
+        for event in reversed(self.journal.tail(40)):
+            if (
+                event.event == "fill"
+                and str(event.ord_no) == str(ord_no)
+                and event.price
+            ):
+                return int(event.price)
+        return None
+
     def _execute_sell(
         self,
         holding: HoldingView,
@@ -1446,6 +1726,7 @@ class AutoTradingStrategy:
         *,
         partial: bool = False,
         tp_stage: int | None = None,
+        be_scaled: bool = False,
     ) -> bool:
         sell_qty = min(sell_qty, holding.sellable_qty)
         order_code = self.client.normalize_stock_code(
@@ -1489,19 +1770,14 @@ class AutoTradingStrategy:
                 computed = calc_profit_pct(entry_price, sell_price)
                 if computed is not None:
                     profit_pct = computed
-            try:
-                self.journal.log(
-                    "sell_order",
-                    code=holding.code,
-                    name=holding.name,
-                    qty=sell_qty,
-                    price=sell_price or None,
-                    profit_pct=profit_pct,
-                    reason=reason + (f" / 지정가 {limit_price}" if limit_price else ""),
-                    ord_no=ord_no,
-                )
-            except Exception:
-                pass
+            self._log_sell_order(
+                holding,
+                sell_qty,
+                price=sell_price or None,
+                profit_pct=profit_pct,
+                reason=reason + (f" / 지정가 {limit_price}" if limit_price else ""),
+                ord_no=ord_no,
+            )
             result.add_event(
                 "【자동매도】\n"
                 f"사유: {reason}\n"
@@ -1527,6 +1803,8 @@ class AutoTradingStrategy:
                 self.positions.mark_partial_sold(holding.code)
             if tp_stage is not None:
                 self.positions.mark_tp_stage(holding.code, tp_stage)
+            if be_scaled:
+                self.positions.mark_be_scaled(holding.code)
             if sell_qty >= holding.sellable_qty:
                 self.positions.mark_exit(holding.code)
                 self.positions.remove(holding.code)
@@ -1546,6 +1824,25 @@ class AutoTradingStrategy:
                         dmst_stex_tp=dmst_stex_tp,
                     )
                     ord_no = order.get("ord_no", "")
+                    state = self.positions.get(holding.code)
+                    entry_price = (
+                        state.entry_price
+                        if state and state.entry_price > 0
+                        else holding.purchase_price
+                    )
+                    profit_pct = holding.profit_pct
+                    if entry_price > 0 and holding.current_price > 0:
+                        computed = calc_profit_pct(entry_price, holding.current_price)
+                        if computed is not None:
+                            profit_pct = computed
+                    self._log_sell_order(
+                        holding,
+                        sell_qty,
+                        price=holding.current_price or None,
+                        profit_pct=profit_pct,
+                        reason=f"{reason} / 지정가 실패 → 시장가",
+                        ord_no=ord_no,
+                    )
                     result.add_event(
                         "【자동매도(대체)】\n"
                         "지정가 실패 → 시장가 재시도\n"
@@ -1565,6 +1862,12 @@ class AutoTradingStrategy:
                             result.add_event(fill_msg)
                         else:
                             result.add_report(fill_msg)
+                    if partial:
+                        self.positions.mark_partial_sold(holding.code)
+                    if tp_stage is not None:
+                        self.positions.mark_tp_stage(holding.code, tp_stage)
+                    if be_scaled:
+                        self.positions.mark_be_scaled(holding.code)
                     if sell_qty >= holding.sellable_qty:
                         self.positions.mark_exit(holding.code)
                         self.positions.remove(holding.code)
@@ -1629,8 +1932,22 @@ class AutoTradingStrategy:
             reason, sell_qty, tp_stage = self._evaluate_sell(
                 holding, state, news, is_top_volume=is_top_volume
             )
-
-            if not reason:
+            vol_class, vol_ratio = self._exit_volume_class(holding.code, reason)
+            if reason and vol_class == "heavy" and vol_ratio is not None:
+                reason = f"{reason} · 거래량 {vol_ratio:.1f}x"
+            confirmed = self._confirm_exit_signal(
+                holding.code, reason, volume_class=vol_class
+            )
+            if reason and not confirmed:
+                wait = "한 번 더 확인"
+                if vol_class == "light" and vol_ratio is not None:
+                    wait = f"거래량 부족 ({vol_ratio:.2f}x)"
+                result.add_report(
+                    f"【청산 대기】 {holding.name}({holding.code}) "
+                    f"{wait} · {reason}"
+                )
+                continue
+            if not confirmed:
                 continue
 
             if holding.sellable_qty <= 0 and holding.qty > 0:
@@ -1644,11 +1961,19 @@ class AutoTradingStrategy:
 
             if sell_qty > 0:
                 is_partial = sell_qty < holding.sellable_qty
+                mark_be = is_partial and reason.startswith("본전스탑")
                 if self._execute_sell(
-                    holding, reason, sell_qty, result, partial=is_partial, tp_stage=tp_stage
+                    holding,
+                    reason,
+                    sell_qty,
+                    result,
+                    partial=is_partial,
+                    tp_stage=tp_stage,
+                    be_scaled=mark_be,
                 ):
                     sold_count += 1
                     self._invalidate_holdings_cache()
+                    self.positions.clear_exit_signal(holding.code)
         return sold_count
 
     def _portfolio_heat_blocks_buy(self, holdings: list[HoldingView]) -> str | None:
@@ -2007,6 +2332,11 @@ class AutoTradingStrategy:
                 return
             eligible = filtered
 
+        orb_filtered = self._apply_orb_morning_filter(eligible, result)
+        if orb_filtered is None:
+            return
+        eligible = orb_filtered
+
         allow_momentum = (
             not is_scalping_mode()
             and strategy_momentum_buy_enabled
@@ -2082,8 +2412,18 @@ class AutoTradingStrategy:
         held_codes: set[str],
         snap,
     ) -> None:
-        """차트 우선 매수: 차트 통과가 본결정, 나머지는 참고 메모."""
+        """차트 우선 매수: 차트 통과가 본결정. 급등·국면·오전 외 모멘텀은 차단."""
         self.chart.prune_stale_cache()
+        allow_momentum, allow_pullback = chart_primary_channel_flags(
+            snap,
+            in_morning=self._in_morning_buy_window(),
+        )
+        if not allow_momentum and not allow_pullback:
+            result.add_report(
+                self._heartbeat("차트우선 - 국면/시간상 채널 없음")
+            )
+            return
+
         universe, rejected = filter_chart_primary_universe(
             candidates,
             held_codes,
@@ -2111,7 +2451,11 @@ class AutoTradingStrategy:
             )
         )
 
-        picked = self._pick_chart_primary(universe)
+        picked = self._pick_chart_primary(
+            universe,
+            allow_momentum=allow_momentum,
+            allow_pullback=allow_pullback,
+        )
         if picked is None:
             result.add_report(
                 self._heartbeat(
@@ -2606,6 +2950,8 @@ class AutoTradingStrategy:
             if state:
                 if state.partial_sold:
                     tags.append("부분익절")
+                if state.be_scaled:
+                    tags.append("본전스케일")
                 if state.tp_stage:
                     tags.append(f"TP{state.tp_stage}")
             tag_txt = f" [{', '.join(tags)}]" if tags else ""

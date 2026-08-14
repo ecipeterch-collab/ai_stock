@@ -120,11 +120,23 @@ function renderMonthlyPnlChart(byMonth) {
   });
 }
 
-function renderAccountSummary(acct) {
+function renderAccountSummary(acct, deposit, holdingsEval) {
   const badge = $("account-mode-badge");
   const deltaEl = $("acct-delta-value");
   const deltaPctEl = $("acct-delta-pct");
   const line = $("account-trading-line");
+  const settleLine = $("account-settle-line");
+
+  const clearSettle = () => {
+    $("acct-d0-value").textContent = "—";
+    $("acct-d1-value").textContent = "—";
+    $("acct-d2-value").textContent = "—";
+    $("acct-holdings-value").textContent = "—";
+    if (settleLine) {
+      settleLine.textContent = "—";
+      settleLine.className = "status-line muted";
+    }
+  };
 
   if (!acct || !acct.trading_summary) {
     badge.textContent = "—";
@@ -137,6 +149,7 @@ function renderAccountSummary(acct) {
     $("acct-fees-value").textContent = "—";
     line.textContent = "거래 기록 없음";
     line.className = "status-line muted";
+    clearSettle();
     renderMonthlyPnlChart([]);
     return;
   }
@@ -146,6 +159,7 @@ function renderAccountSummary(acct) {
   const total = as.total_assets_krw ?? acct.live_totals?.total_assets_krw;
   const delta = as.balance_delta_krw;
   const deltaPct = as.return_on_capital_pct;
+  const dep = deposit || {};
 
   badge.textContent = acct.trade_mode_label || "—";
   $("acct-total-value").textContent = formatWonPlain(total);
@@ -154,6 +168,24 @@ function renderAccountSummary(acct) {
   deltaPctEl.textContent =
     deltaPct != null ? `(${deltaPct >= 0 ? "+" : ""}${deltaPct}%)` : "";
   deltaPctEl.className = profitClass(deltaPct);
+
+  $("acct-d0-value").textContent = formatWonPlain(dep.cash);
+  $("acct-d1-value").textContent = formatWonPlain(dep.d1_cash);
+  $("acct-d2-value").textContent = formatWonPlain(dep.d2_cash);
+  $("acct-holdings-value").textContent = formatWonPlain(holdingsEval);
+  if (settleLine) {
+    const buy = dep.d1_buy_exct || 0;
+    const sell = dep.d1_sel_exct || 0;
+    const gap = (dep.d2_cash || 0) - (dep.cash || 0);
+    const parts = [];
+    if (sell) parts.push(`오늘 매도 ${formatWonPlain(sell)}`);
+    if (buy) parts.push(`오늘 매수 ${formatWonPlain(buy)}`);
+    if (gap) parts.push(`D+0↔D+2 차이 ${formatWon(gap)}`);
+    settleLine.textContent = parts.length
+      ? `${parts.join(" · ")} · D+0은 결제 전 예수금`
+      : "D+0은 결제 전 예수금 · 총자산은 D+2+보유";
+    settleLine.className = "status-line muted";
+  }
 
   $("acct-initial-value").textContent = formatWonPlain(acct.initial_capital_krw);
   const netEl = $("acct-trading-net");
@@ -517,7 +549,12 @@ function renderDashboard(data) {
   $("auto-value").textContent = data.auto_trading ? "ON" : "OFF";
   $("auto-value").className = data.auto_trading ? "profit-pos" : "muted";
 
-  renderAccountSummary(data.account_summary);
+  renderAccountSummary(
+    data.account_summary,
+    data.deposit,
+    data.portfolio_value
+  );
+  window.__lastHoldings = data.holdings || [];
   renderHoldings(data.holdings || []);
   renderChart(data.holdings || []);
 
@@ -578,6 +615,7 @@ function showCommandResult(text, ok = true) {
   box.textContent = text;
   box.classList.remove("hidden", "command-error");
   if (!ok) box.classList.add("command-error");
+  box.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function hideCommandArgs() {
@@ -590,9 +628,16 @@ function openCommandArgs(item) {
   pendingCommand = item;
   $("command-args-label").textContent = item.args_label || "인자";
   $("command-arg-input").placeholder = item.args_placeholder || "";
-  $("command-arg-input").value = "";
+  let preset = "";
+  if (item.id === "sell") {
+    const h = (window.__lastHoldings || []).find((x) => (x.sellable_qty || 0) > 0);
+    if (h) preset = `${h.code} ${h.sellable_qty}`;
+  }
+  $("command-arg-input").value = preset;
   $("command-args-box").classList.remove("hidden");
+  $("command-args-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
   $("command-arg-input").focus();
+  $("command-arg-input").select();
 }
 
 async function executeCommandText(text, refreshAfter = false) {
@@ -701,6 +746,14 @@ $("login-form").addEventListener("submit", async (e) => {
 $("command-args-run").addEventListener("click", () => {
   if (!pendingCommand) return;
   const args = $("command-arg-input").value.trim();
+  if (pendingCommand.needs_args && !args) {
+    showCommandResult(
+      `인자를 입력하세요. 예: ${pendingCommand.args_placeholder || "005930 1"}`,
+      false
+    );
+    $("command-arg-input").focus();
+    return;
+  }
   const text = args ? `${pendingCommand.cmd} ${args}` : pendingCommand.cmd;
   hideCommandArgs();
   executeCommandText(text, true);

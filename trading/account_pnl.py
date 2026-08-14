@@ -107,7 +107,7 @@ def _apply_fill_prices(events: list[TradeEvent]) -> list[TradeEvent]:
         return events
     out: list[TradeEvent] = []
     for e in events:
-        if e.ord_no and e.ord_no in fill_px and e.price:
+        if e.event != "fill" and e.ord_no and e.ord_no in fill_px:
             out.append(
                 TradeEvent(
                     ts=e.ts,

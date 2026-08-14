@@ -33,26 +33,40 @@ trade_sell_tax_rate_pct = 0.20
 # 차트 매수 필터 (VWAP·MA·RSI·거래량) — ka10080/ka10081
 chart_filter_enabled = True
 chart_minute_interval = "5"
-chart_min_score = 10.0  # 8→10: 저점수 구간 손실 다수 (실측)
+chart_min_score = 8.0  # 완화: 기회 확대 (일봉>20MA·RSI 하드게이트 유지)
 chart_score_weight = 0.5
 chart_ma_fast = 5
 chart_ma_slow = 20
 chart_vwap_tolerance_pct = 0.3
-chart_vwap_max_above_pct = 3.0  # VWAP +3% 초과 추격 매수 차단
-chart_rsi_min = 40  # 35→40: 극단 RSI 손실 회피
-chart_rsi_max = 60  # 65→60
-chart_volume_breakout_ratio = 1.5
+chart_vwap_max_above_pct = 5.0  # VWAP 위 추격 여유
+chart_rsi_min = 35
+chart_rsi_max = 70
+chart_volume_breakout_ratio = 1.3
 chart_volume_pullback_max_ratio = 0.7
 chart_cache_daily_ttl_sec = 1800
-chart_cache_minute_ttl_sec = 300
+chart_cache_minute_ttl_sec = 90
 chart_eval_max_candidates = 5
-# 차트 우선 매수: 국면·등락·점수·뉴스는 참고/알림, 차트 통과가 매수 본결정
+# 차트 우선: False면 모멘텀·점수 채널이 본결정
 chart_primary_mode = True
 chart_primary_eval_max_candidates = 10
+strategy_chart_primary_max_flu_rt = 8.0  # 당일 등락 이 % 초과 차트우선 매수 금지
+
+# Opening Range Breakout (시초 15분 고가 돌파)
+orb_enabled = True
+orb_range_start = "09:00"
+orb_range_end = "09:15"
+orb_trade_end = "10:00"
+orb_volume_breakout_ratio = 1.3
+orb_require_above_vwap = True
+orb_min_range_pct = 0.2
+orb_max_range_pct = 6.0
+orb_score_bonus = 4.0
+orb_wait_for_range = True
+orb_morning_momentum_only = True
 
 # 노트 기본 매매법 (MA 기울기·캔들·차트형) — 차트 필터 가점/하드게이트
 notebook_strategy_enabled = True
-notebook_require_ma_uptrend = True
+notebook_require_ma_uptrend = False  # 장기MA 상승 하드차단 OFF (5MA≥20MA 유지)
 notebook_ma_slope_lookback = 3
 notebook_candle_bonus_enabled = True
 notebook_pattern_block_bearish = True
@@ -68,7 +82,7 @@ notebook_bonus_bull_flag = 2.0
 notebook_bonus_asc_triangle = 2.0
 
 default_order_qty = 1
-auto_interval_sec = 300
+auto_interval_sec = 90
 auto_max_buys_per_day = 10
 fill_poll_wait_sec = 30
 fill_poll_interval_sec = 2
@@ -92,7 +106,7 @@ position_addon_momentum_min_peak_pct = 0.5
 position_addon_max_per_day = 2
 position_addon_max_qty_multiplier = 3.0
 
-strategy_stop_loss_pct = 2.0  # 손절 (실측 손절 채널 최대 손실)
+strategy_stop_loss_pct = 4.0  # 손절 (%) — 보유 중심
 # 아침 모멘텀 채널: 장 초반 순위 급등 + 상승 중 종목 허용 (러너 포착)
 strategy_momentum_buy_enabled = True
 strategy_momentum_window_end = "10:00"
@@ -101,16 +115,24 @@ strategy_momentum_max_flu_rt = 4.0
 strategy_momentum_optimal_flu_rt = 3.0
 strategy_momentum_min_rank_improve = 10
 # 본전스탑/수익보호: 1주 포지션도 작동 (부분익절 게이트 없음)
+# 본전스탑은 2주+이면 50%만 매도하고 잔량은 더 넓은 폭으로 트레일
+# 본전스탑·수익보호는 한 번 터치로 안 팔고 다음 점검까지 확인
+# 분봉 거래량: 평균 대비 낮으면 대기, 높으면 즉시 청산
 strategy_swing_breakeven_activate_pct = 3.0
 strategy_swing_breakeven_floor_pct = 0.5
 strategy_swing_protect_trailing_activate_pct = 5.0
 strategy_swing_protect_trailing_drawdown_pct = 1.5
-# 정체 청산(time-stop): 장시간 수익 전환 실패한 "죽은 돈" 정리
-strategy_swing_stagnation_minutes = 120
+strategy_swing_be_remainder_drawdown_pct = 3.0
+strategy_swing_exit_confirm_cycles = 2
+strategy_swing_exit_vol_lookback = 20
+strategy_swing_exit_vol_light_ratio = 0.8
+strategy_swing_exit_vol_heavy_ratio = 1.5
+# 정체 청산(time-stop): 0이면 비활성 (손절·익절·트레일·장마감만 사용)
+strategy_swing_stagnation_minutes = 0
 strategy_swing_stagnation_max_profit_pct = 0.5
 # 손실 종목 재진입 차단: 최근 손실 청산 종목은 일정 시간 재매수 금지
 strategy_loser_reentry_cooldown_hours = 48.0
-strategy_swing_take_profit_pct = 6.0  # 실측상 +10% 도달 0회 → 현실화
+strategy_swing_take_profit_pct = 4.0  # 익절: 1주=전량, 2주+=50% (실측 고점 3~5%)
 strategy_swing_top_volume_tp1_pct = 15.0
 strategy_swing_top_volume_tp2_pct = 20.0
 strategy_swing_trailing_activate_pct = 12.0
@@ -157,11 +179,12 @@ strategy_circuit_consecutive_losses = 3
 strategy_circuit_cooldown_minutes = 60
 strategy_circuit_stop_for_day_consecutive_losses = 5
 # 매수 시간: 09:30~10:00 모멘텀, 10:00~14:00 국면 허용 채널만 (횡보는 신규매수 없음)
-strategy_buy_morning_start = "09:30"
+strategy_buy_morning_start = "09:10"
 strategy_buy_morning_end = "10:00"
 strategy_buy_afternoon_start = "10:00"
 strategy_buy_afternoon_end = "14:00"
 strategy_eod_cut_loss_time = "15:10"
+strategy_eod_cut_loss_enabled = False  # False: 장마감 손실 강제청산 안 함
 strategy_eod_sell_time = "15:20"
 strategy_eod_sell_enabled = True
 strategy_swing_eod_sell_all = False
@@ -203,7 +226,7 @@ regime_bear_max_bullish_ratio = 0.30
 regime_high_vol_min_avg_abs_flu_rt = 2.5
 regime_high_vol_min_news_risk = 0.65
 # 모멘텀·차트 집중: 눌림/트렌드 공회전(횡보·고변동) 축소
-regime_bull_channels = ("momentum", "addon")
+regime_bull_channels = ("momentum", "pullback", "addon")
 regime_sideways_channels = ("addon",)  # 횡보: 신규매수 없음, 추가매수만
 regime_bear_channels = ("crash", "addon")
 regime_high_vol_channels = ("momentum", "crash", "addon")  # 눌림 제거

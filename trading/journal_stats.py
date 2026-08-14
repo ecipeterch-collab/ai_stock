@@ -253,20 +253,89 @@ def _resolved_profit_pct(
     return float(journal_pct or 0.0)
 
 
+BUY_EVENTS = frozenset(
+    {"buy_order", "trend_buy_order", "crash_buy_order", "addon_buy_order"}
+)
+UNMATCHED_FILL_SELL_REASON = "체결만 기록 (주문 로그 없음)"
+
+
+def _close_against_open_lots(
+    *,
+    open_lots: dict[str, list[OpenLot]],
+    ts: str,
+    code: str,
+    name: str,
+    qty: int,
+    sell_price: int | None,
+    sell_reason: str,
+    journal_pct: float | None,
+) -> ClosedTrade:
+    remaining = qty
+    lots = open_lots.get(code, [])
+    entry_channel = "unknown"
+    entry_ts = ""
+    buy_reason = ""
+    entry_price: int | None = None
+
+    while remaining > 0 and lots:
+        lot = lots[0]
+        take = min(remaining, lot.qty)
+        entry_channel = lot.entry_channel
+        entry_ts = lot.ts
+        buy_reason = lot.buy_reason
+        entry_price = lot.price or None
+        lot.qty -= take
+        remaining -= take
+        if lot.qty <= 0:
+            lots.pop(0)
+
+    if remaining > 0 and not entry_ts:
+        entry_channel = "unknown"
+
+    profit_pct = _resolved_profit_pct(
+        entry_price=entry_price,
+        sell_price=sell_price,
+        journal_pct=journal_pct,
+    )
+    pnl_krw = (
+        calc_pnl_krw(entry_price, sell_price, qty)
+        if entry_price and sell_price
+        else None
+    )
+    return ClosedTrade(
+        ts=ts,
+        code=code,
+        name=name,
+        qty=qty,
+        entry_channel=entry_channel,
+        entry_ts=entry_ts,
+        buy_reason=buy_reason,
+        sell_reason=sell_reason,
+        exit_category=classify_exit_category(sell_reason),
+        exit_mode=classify_exit_mode(sell_reason),
+        profit_pct=profit_pct,
+        entry_price=entry_price,
+        sell_price=sell_price,
+        pnl_krw=pnl_krw,
+    )
+
+
 def build_closed_trades(events: list[TradeEvent]) -> list[ClosedTrade]:
     """매수·매도 이벤트를 FIFO로 매칭해 완결 거래 목록 생성."""
+    from trading.account_pnl import _apply_fill_prices
+
+    events = _apply_fill_prices(events)
     open_lots: dict[str, list[OpenLot]] = defaultdict(list)
     closed: list[ClosedTrade] = []
+    buy_ords: set[str] = set()
+    sell_ords: set[str] = set()
 
     for e in events:
-        if e.event in (
-            "buy_order",
-            "trend_buy_order",
-            "crash_buy_order",
-            "addon_buy_order",
-        ):
+        if e.event in BUY_EVENTS:
             if not e.code or e.qty is None or e.qty <= 0:
                 continue
+            if e.ord_no:
+                buy_ords.add(str(e.ord_no))
             open_lots[e.code].append(
                 OpenLot(
                     entry_channel=classify_entry(e.event, e.reason),
@@ -280,61 +349,44 @@ def build_closed_trades(events: list[TradeEvent]) -> list[ClosedTrade]:
             )
             continue
 
-        if e.event != "sell_order":
+        if e.event == "sell_order":
+            if not e.code or e.qty is None or e.qty <= 0:
+                continue
+            if e.ord_no:
+                sell_ords.add(str(e.ord_no))
+            closed.append(
+                _close_against_open_lots(
+                    open_lots=open_lots,
+                    ts=e.ts,
+                    code=e.code,
+                    name=e.name,
+                    qty=e.qty,
+                    sell_price=e.price,
+                    sell_reason=e.reason,
+                    journal_pct=e.profit_pct,
+                )
+            )
+            continue
+
+        if e.event != "fill":
             continue
         if not e.code or e.qty is None or e.qty <= 0:
             continue
-
-        remaining = e.qty
-        lots = open_lots.get(e.code, [])
-        entry_channel = "unknown"
-        entry_ts = ""
-        buy_reason = ""
-        entry_price: int | None = None
-
-        while remaining > 0 and lots:
-            lot = lots[0]
-            take = min(remaining, lot.qty)
-            entry_channel = lot.entry_channel
-            entry_ts = lot.ts
-            buy_reason = lot.buy_reason
-            entry_price = lot.price or None
-            lot.qty -= take
-            remaining -= take
-            if lot.qty <= 0:
-                lots.pop(0)
-
-        if remaining > 0 and not entry_ts:
-            entry_channel = "unknown"
-
-        sell_price = e.price
-        profit_pct = _resolved_profit_pct(
-            entry_price=entry_price,
-            sell_price=sell_price,
-            journal_pct=e.profit_pct,
-        )
-        pnl_krw = (
-            calc_pnl_krw(entry_price, sell_price, e.qty)
-            if entry_price and sell_price
-            else None
-        )
-
+        ord_no = str(e.ord_no or "")
+        if ord_no and (ord_no in buy_ords or ord_no in sell_ords):
+            continue
+        if not open_lots.get(e.code):
+            continue
         closed.append(
-            ClosedTrade(
+            _close_against_open_lots(
+                open_lots=open_lots,
                 ts=e.ts,
                 code=e.code,
                 name=e.name,
                 qty=e.qty,
-                entry_channel=entry_channel,
-                entry_ts=entry_ts,
-                buy_reason=buy_reason,
-                sell_reason=e.reason,
-                exit_category=classify_exit_category(e.reason),
-                exit_mode=classify_exit_mode(e.reason),
-                profit_pct=profit_pct,
-                entry_price=entry_price,
-                sell_price=sell_price,
-                pnl_krw=pnl_krw,
+                sell_price=e.price,
+                sell_reason=e.reason or UNMATCHED_FILL_SELL_REASON,
+                journal_pct=e.profit_pct,
             )
         )
 

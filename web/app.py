@@ -67,7 +67,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 app.add_middleware(SecurityHeadersMiddleware)
 
 
-@app.get("/api/health")
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 def health() -> dict:
     url = get_external_url()
     return {"ok": True, "external_url": url, "tunnel_enabled": web_tunnel_enabled}
@@ -144,8 +144,9 @@ async def runtime_config_error(_request: Request, exc: RuntimeError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def index():
+    """대시보드 HTML. HEAD는 터널·프리페치 헬스체크용(405 방지)."""
     return FileResponse(STATIC_DIR / "index.html")
 
 

@@ -91,6 +91,27 @@ def _get_bot() -> TelegramTradingBot:
         return _bot
 
 
+def _command_failed(text: str) -> bool:
+    """핸들러가 문자열로 돌려준 실패/불가 응답 판별."""
+    head = (text or "").lstrip()
+    if head.startswith(
+        (
+            "API 오류",
+            "HTTP 오류",
+            "네트워크 오류",
+            "입력 오류",
+            "사용법:",
+            "알 수 없는 명령",
+            "【매수 불가】",
+            "【매도 불가】",
+            "【매수 실패】",
+            "【매도 실패】",
+        )
+    ):
+        return True
+    return False
+
+
 def run_command(text: str) -> dict[str, Any]:
     """텔레그램과 동일한 명령 실행."""
     text = (text or "").strip()
@@ -109,4 +130,5 @@ def run_command(text: str) -> dict[str, Any]:
     if result is None:
         return {"ok": False, "text": "명령 형식이 올바르지 않습니다.", "command": text}
 
-    return {"ok": True, "text": result, "command": text.split()[0]}
+    ok = not _command_failed(result)
+    return {"ok": ok, "text": result, "command": text.split()[0]}

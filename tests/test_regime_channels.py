@@ -18,19 +18,19 @@ def _snap(regime: MarketRegime) -> RegimeSnapshot:
     )
 
 
-def test_bull_allows_momentum_not_pullback_or_trend(monkeypatch) -> None:
+def test_bull_allows_momentum_and_pullback_not_trend(monkeypatch) -> None:
     import trading.market_regime as mr
 
     monkeypatch.setattr(mr, "regime_enabled", True)
     monkeypatch.setitem(
         mr._REGIME_CHANNELS,
         MarketRegime.BULL,
-        ("momentum", "addon"),
+        ("momentum", "pullback", "addon"),
     )
     snap = _snap(MarketRegime.BULL)
     assert is_channel_allowed(snap, "momentum")
+    assert is_channel_allowed(snap, "pullback")
     assert is_channel_allowed(snap, "addon")
-    assert not is_channel_allowed(snap, "pullback")
     assert not is_channel_allowed(snap, "trend")
 
 
@@ -62,12 +62,13 @@ def test_high_vol_allows_momentum_and_crash_not_pullback(monkeypatch) -> None:
     assert not is_channel_allowed(snap, "trend")
 
 
-def test_live_config_matches_momentum_focus_policy() -> None:
-    """실제 config가 모멘텀 집중 정책과 일치하는지 확인."""
+def test_live_config_matches_chart_primary_bull_pullback_policy() -> None:
+    """차트우선 ON · 강세에 눌림 허용 · 횡보/고변동 트렌드 차단."""
     from config import config as cfg
 
+    assert cfg.chart_primary_mode is True
     assert "momentum" in cfg.regime_bull_channels
-    assert "pullback" not in cfg.regime_bull_channels
+    assert "pullback" in cfg.regime_bull_channels
     assert "trend" not in cfg.regime_bull_channels
     assert "pullback" not in cfg.regime_sideways_channels
     assert "trend" not in cfg.regime_sideways_channels
@@ -77,3 +78,7 @@ def test_live_config_matches_momentum_focus_policy() -> None:
     assert cfg.trend_auto_buy_enabled is False
     assert cfg.strategy_momentum_buy_enabled is True
     assert cfg.chart_filter_enabled is True
+    assert cfg.strategy_swing_take_profit_pct == 4.0
+    assert cfg.auto_interval_sec == 90
+    assert cfg.chart_cache_minute_ttl_sec == 90
+    assert cfg.strategy_chart_primary_max_flu_rt == 8.0

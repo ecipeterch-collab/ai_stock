@@ -249,6 +249,16 @@ input {
   font-size: 1.1rem;
 }
 
+.account-panel .hint {
+  display: block;
+  font-size: 0.72rem;
+  margin-top: 2px;
+}
+
+.settle-cards {
+  margin-bottom: 6px;
+}
+
 .account-cards {
   margin-bottom: 8px;
 }

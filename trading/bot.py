@@ -31,7 +31,9 @@ from trading.runtime_config import (
     mode_label,
     set_strategy_mode,
 )
+from trading.market_utils import is_market_open, market_status_text
 from trading.strategy import AutoTradingStrategy
+
 
 def _get_updates_url() -> str:
     if not telegram_token:
@@ -284,11 +286,31 @@ class TelegramTradingBot:
             lines.append(f"{rank}. {name}({code}) {price} / {amount}")
         return "\n".join(lines)
 
+    def _manual_order_market_guard(self, action: str) -> str | None:
+        """모의/정규장 시장가 주문은 장중에만 허용."""
+        if is_market_open():
+            return None
+        status = market_status_text()
+        return (
+            f"【{action} 불가】 현재 {status}입니다.\n"
+            "모의투자는 정규장(09:00~15:30)에만 시장가 주문이 가능합니다.\n"
+            "인자 예: /buy 005930 1  ·  /sell 035420 1"
+        )
+
     def _cmd_buy(self, args: list[str]) -> str:
         if not args:
             return "사용법: /buy 종목코드 [수량]"
+        blocked = self._manual_order_market_guard("매수")
+        if blocked:
+            return blocked
         code = self.client.normalize_stock_code(args[0])
-        qty = int(args[1]) if len(args) > 1 else default_order_qty
+        try:
+            qty = int(args[1]) if len(args) > 1 else int(default_order_qty)
+        except ValueError:
+            return "사용법: /buy 종목코드 [수량]  (수량은 정수)"
+        if qty <= 0:
+            return "수량은 1주 이상이어야 합니다."
+
         result = self.client.buy_market(code, qty, dmst_stex_tp=dmst_stex_tp)
         ord_no = result.get("ord_no", "")
         lines = [
@@ -299,19 +321,53 @@ class TelegramTradingBot:
         if fill_msg:
             lines.append(fill_msg)
             threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()
+        fill_price = self.strategy.latest_fill_price(ord_no)
+        try:
+            self.strategy.journal.log(
+                "buy_order",
+                code=code,
+                name=code,
+                qty=qty,
+                price=fill_price,
+                reason="수동매수(웹/텔레그램)",
+                ord_no=ord_no,
+            )
+        except Exception:
+            pass
+        try:
+            self.strategy.positions.register(
+                code, code, fill_price or 0, entry_qty=qty
+            )
+        except Exception:
+            pass
+        self.strategy._invalidate_holdings_cache()
         return "\n".join(lines)
 
     def _cmd_sell(self, args: list[str]) -> str:
         if not args:
             return "사용법: /sell 종목코드 [수량]"
+        blocked = self._manual_order_market_guard("매도")
+        if blocked:
+            return blocked
         code = self.client.normalize_stock_code(args[0])
-        qty = int(args[1]) if len(args) > 1 else default_order_qty
+        try:
+            qty = int(args[1]) if len(args) > 1 else int(default_order_qty)
+        except ValueError:
+            return "사용법: /sell 종목코드 [수량]  (수량은 정수)"
+        if qty <= 0:
+            return "수량은 1주 이상이어야 합니다."
 
         holdings = self.client.get_holdings()
         sellable = 0
+        name = code
+        purchase_price = 0
+        current_price = 0
         for item in holdings:
             if self.client.normalize_stock_code(item.get("stk_cd", "")) == code:
                 sellable = self.client.parse_qty(item.get("trde_able_qty", "0"))
+                name = item.get("stk_nm", code) or code
+                purchase_price = self.client.parse_price(item.get("pur_pric", "0"))
+                current_price = self.client.parse_price(item.get("cur_prc", "0"))
                 break
         if sellable <= 0:
             return (
@@ -323,11 +379,44 @@ class TelegramTradingBot:
 
         result = self.client.sell_market(code, qty, dmst_stex_tp=dmst_stex_tp)
         ord_no = result.get("ord_no", "")
+        state = self.strategy.positions.get(code)
+        entry_price = (
+            state.entry_price
+            if state and state.entry_price > 0
+            else purchase_price
+        )
+        profit_pct = None
+        if entry_price > 0 and current_price > 0:
+            from trading.market_utils import calc_profit_pct
+
+            profit_pct = calc_profit_pct(entry_price, current_price)
+        try:
+            self.strategy.journal.log(
+                "sell_order",
+                code=code,
+                name=name,
+                qty=qty,
+                price=current_price or None,
+                profit_pct=profit_pct,
+                reason="수동매도(웹/텔레그램)",
+                ord_no=ord_no,
+            )
+        except Exception:
+            pass
+        if qty >= sellable:
+            try:
+                self.strategy.positions.mark_exit(code)
+                self.strategy.positions.remove(code)
+            except Exception:
+                pass
+        self.strategy._invalidate_holdings_cache()
         lines = [
-            f"[매도] {code} {qty}주",
+            f"[매도] {name}({code}) {qty}주",
             f"{result.get('return_msg', '')} (주문번호: {ord_no})",
         ]
-        fill_msg = self.strategy.check_order_fill(ord_no, code, sell_tp="1")
+        fill_msg = self.strategy.check_order_fill(
+            ord_no, code, sell_tp="1", stk_nm=name
+        )
         if fill_msg:
             lines.append(fill_msg)
             threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()

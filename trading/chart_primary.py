@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from config.config import (
+    regime_enabled,
+    strategy_chart_primary_max_flu_rt,
+    strategy_momentum_buy_enabled,
+)
+from trading.market_regime import RegimeSnapshot, is_channel_allowed
 from trading.scoring import CandidateView, is_market_bullish, score_candidate
 from trading.symbol_filters import is_etf, is_leveraged_etf
 
@@ -12,8 +18,14 @@ def filter_chart_primary_universe(
     *,
     block_etf: bool = True,
     block_leveraged_etf: bool = True,
+    max_flu_rt: float | None = None,
 ) -> tuple[list[CandidateView], list[str]]:
-    """보유·ETF만 제외. 등락/점수/국면은 제외하지 않는다."""
+    """보유·ETF·급등 추격(등락 상한)을 제외. 점수/국면은 여기서 제외하지 않는다."""
+    cap = (
+        float(strategy_chart_primary_max_flu_rt)
+        if max_flu_rt is None
+        else float(max_flu_rt)
+    )
     kept: list[CandidateView] = []
     rejected: list[str] = []
     for cand in candidates:
@@ -30,8 +42,34 @@ def filter_chart_primary_universe(
         ):
             rejected.append(f"{cand.name}: 레버리지/인버스 ETF 제외")
             continue
+        if cap > 0 and cand.flu_rt > cap:
+            rejected.append(
+                f"{cand.name}: 등락 {cand.flu_rt:+.2f}% > +{cap:.1f}%"
+            )
+            continue
         kept.append(cand)
     return kept, rejected
+
+
+def chart_primary_channel_flags(
+    snap: RegimeSnapshot | None,
+    *,
+    in_morning: bool,
+    momentum_buy_enabled: bool | None = None,
+) -> tuple[bool, bool]:
+    """차트 우선에서 시도할 차트 모드 (모멘텀, 눌림)."""
+    mom_on = (
+        strategy_momentum_buy_enabled
+        if momentum_buy_enabled is None
+        else momentum_buy_enabled
+    )
+    allow_momentum = bool(in_morning) and mom_on
+    allow_pullback = True
+    if regime_enabled and snap is not None:
+        if allow_momentum and not is_channel_allowed(snap, "momentum"):
+            allow_momentum = False
+        allow_pullback = is_channel_allowed(snap, "pullback")
+    return allow_momentum, allow_pullback
 
 
 def build_buy_advisory_notes(

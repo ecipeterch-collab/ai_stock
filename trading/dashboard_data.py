@@ -24,16 +24,55 @@ def _resolve_strategy() -> AutoTradingStrategy:
         return AutoTradingStrategy(get_shared_client())
 
 
+def _deposit_amt(client, deposit: dict, key: str) -> int:
+    return int(client.parse_price(deposit.get(key, "0")))
+
+
 def _deposit_numbers(client, deposit: dict) -> dict:
     fmt = client.format_amount
+    cash = _deposit_amt(client, deposit, "entr")
+    d1_cash = _deposit_amt(client, deposit, "d1_entra")
+    d2_cash = _deposit_amt(client, deposit, "d2_entra")
+    settled_cash = d2_cash or d1_cash or cash
     return {
-        "cash": int(client.parse_price(deposit.get("entr", "0"))),
-        "orderable": int(client.parse_price(deposit.get("ord_alow_amt", "0"))),
-        "withdrawable": int(client.parse_price(deposit.get("pymn_alow_amt", "0"))),
+        "cash": cash,
+        "d1_cash": d1_cash,
+        "d2_cash": d2_cash,
+        "settled_cash": settled_cash,
+        "orderable": _deposit_amt(client, deposit, "ord_alow_amt"),
+        "withdrawable": _deposit_amt(client, deposit, "pymn_alow_amt"),
+        "d1_buy_exct": _deposit_amt(client, deposit, "d1_buy_exct_amt"),
+        "d1_sel_exct": _deposit_amt(client, deposit, "d1_sel_exct_amt"),
         "cash_fmt": fmt(deposit.get("entr", "0")),
+        "d1_cash_fmt": fmt(deposit.get("d1_entra", "0")),
+        "d2_cash_fmt": fmt(deposit.get("d2_entra", "0")),
         "orderable_fmt": fmt(deposit.get("ord_alow_amt", "0")),
         "withdrawable_fmt": fmt(deposit.get("pymn_alow_amt", "0")),
     }
+
+
+def apply_live_account_totals(
+    acct: dict,
+    *,
+    settled_cash: int,
+    holdings_eval: int,
+) -> dict:
+    """총자산 = 결제 반영 예수금(D+2 우선) + 보유평가. D+0 예수금은 쓰지 않는다."""
+    initial = int(acct.get("initial_capital_krw") or 0)
+    total_assets = int(settled_cash) + int(holdings_eval)
+    acct_summary = dict(acct.get("account_summary") or {})
+    acct_summary["total_assets_krw"] = total_assets
+    if initial > 0:
+        delta = total_assets - initial
+        acct_summary["balance_delta_krw"] = delta
+        acct_summary["return_on_capital_pct"] = round(delta / initial * 100, 4)
+    acct["account_summary"] = acct_summary
+    acct["live_totals"] = {
+        "cash_krw": int(settled_cash),
+        "holdings_eval_krw": int(holdings_eval),
+        "total_assets_krw": total_assets,
+    }
+    return acct
 
 
 def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dict:
@@ -89,6 +128,8 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
             if state:
                 if state.partial_sold:
                     tags.append("부분익절")
+                if state.be_scaled:
+                    tags.append("본전스케일")
                 if state.tp_stage:
                     tags.append(f"TP{state.tp_stage}")
             rows.append(
@@ -147,24 +188,15 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
 
     try:
         acct = build_account_summary(include_live_balance=False)
-        cash = int((snapshot.get("deposit") or {}).get("cash") or 0)
+        deposit = snapshot.get("deposit") or {}
+        settled_cash = int(deposit.get("settled_cash") or deposit.get("cash") or 0)
         holdings_eval = int(snapshot.get("portfolio_value") or 0)
-        if cash or holdings_eval:
-            initial = int(acct.get("initial_capital_krw") or 0)
-            total_assets = cash + holdings_eval
-            acct_summary = dict(acct.get("account_summary") or {})
-            acct_summary["total_assets_krw"] = total_assets
-            if initial > 0:
-                acct_summary["balance_delta_krw"] = total_assets - initial
-                acct_summary["return_on_capital_pct"] = round(
-                    (total_assets - initial) / initial * 100, 4
-                )
-            acct["account_summary"] = acct_summary
-            acct["live_totals"] = {
-                "cash_krw": cash,
-                "holdings_eval_krw": holdings_eval,
-                "total_assets_krw": total_assets,
-            }
+        if settled_cash or holdings_eval:
+            apply_live_account_totals(
+                acct,
+                settled_cash=settled_cash,
+                holdings_eval=holdings_eval,
+            )
         snapshot["account_summary"] = acct
     except OSError:
         snapshot["account_summary"] = None

@@ -27,7 +27,7 @@ from config.config import (
 )
 from kiwoom.client import KiwoomClient
 from trading.notebook_patterns import evaluate_notebook_patterns
-from trading.scoring import CandidateView, is_momentum_candidate
+from trading.scoring import CandidateView
 
 
 @dataclass
@@ -100,6 +100,42 @@ def rsi(closes: list[float], period: int = 14) -> float | None:
         return 100.0
     rs = gains / losses
     return 100.0 - (100.0 / (1.0 + rs))
+
+
+def latest_vs_avg_volume_ratio(
+    candles: list[Candle],
+    *,
+    lookback: int = 20,
+) -> float | None:
+    """최근 분봉 거래량 / 직전 lookback봉 평균. 데이터 부족 시 None."""
+    lookback = max(1, int(lookback))
+    usable = min(lookback, len(candles) - 1)
+    if usable < 5:
+        return None
+    current = candles[-1].volume
+    prior = [c.volume for c in candles[-1 - usable : -1] if c.volume > 0]
+    if len(prior) < 5 or current < 0:
+        return None
+    avg = sum(prior) / len(prior)
+    if avg <= 0:
+        return None
+    return current / avg
+
+
+def classify_exit_volume(
+    ratio: float | None,
+    *,
+    light_ratio: float,
+    heavy_ratio: float,
+) -> str:
+    """본전스탑·수익보호용 거래량 판정: light | normal | heavy."""
+    if ratio is None:
+        return "normal"
+    if ratio < light_ratio:
+        return "light"
+    if ratio >= heavy_ratio:
+        return "heavy"
+    return "normal"
 
 
 def vwap(candles: list[Candle]) -> float | None:
@@ -517,6 +553,15 @@ class ChartSignalAnalyzer:
         self._set_cached(self._minute_cache, key, candles)
         return candles
 
+    def load_minute_candles(
+        self,
+        code: str,
+        *,
+        as_of: datetime | None = None,
+    ) -> list[Candle]:
+        """분봉 로드 (ORB 등 외부 필터용)."""
+        return self._load_minute(code, as_of)
+
     def prefetch_daily(
         self,
         codes: list[str],
@@ -569,8 +614,6 @@ class ChartSignalAnalyzer:
         as_of: datetime | None = None,
     ) -> ChartSignalResult:
         mode = "momentum" if momentum else "pullback"
-        if momentum or is_momentum_candidate(candidate):
-            mode = "momentum"
         return self.evaluate(
             code=candidate.code,
             current_price=candidate.current_price,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import datetime
 from pathlib import Path
 
@@ -21,10 +21,18 @@ class PositionState:
     partial_sold: bool = False
     tp_stage: int = 0  # 0: none, 1: stage1 done, 2: stage2 done
     addon_buys: int = 0
+    be_scaled: bool = False  # 본전스탑 50% 완료 → 잔량 트레일
+    pending_exit_key: str = ""
+    pending_exit_count: int = 0
 
     def update_peak(self, profit_pct: float) -> None:
         if profit_pct > self.peak_profit_pct:
             self.peak_profit_pct = profit_pct
+
+
+def _position_state_from_dict(data: dict) -> PositionState:
+    allowed = {f.name for f in fields(PositionState)}
+    return PositionState(**{k: v for k, v in (data or {}).items() if k in allowed})
 
 
 class PositionTracker:
@@ -34,12 +42,14 @@ class PositionTracker:
         self.path = path
         self._positions: dict[str, PositionState] = {}
         self._cooldowns: dict[str, str] = {}
+        self._pending_exits: dict[str, tuple[str, int]] = {}
         self.load()
 
     def load(self) -> None:
         if not self.path.exists():
             self._positions = {}
             self._cooldowns = {}
+            self._pending_exits = {}
             return
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
@@ -47,7 +57,7 @@ class PositionTracker:
                 positions_raw = raw.get("positions") or {}
                 cooldowns_raw = raw.get("cooldowns") or {}
                 self._positions = {
-                    code: PositionState(**data)
+                    code: _position_state_from_dict(data)
                     for code, data in positions_raw.items()
                 }
                 self._cooldowns = {
@@ -56,7 +66,7 @@ class PositionTracker:
             else:
                 # backward compatible: older format was {code: PositionState}
                 self._positions = {
-                    code: PositionState(**data)
+                    code: _position_state_from_dict(data)
                     for code, data in (raw or {}).items()
                 }
                 self._cooldowns = {}
@@ -174,6 +184,38 @@ class PositionTracker:
         state = self._positions.get(self._norm(code))
         if state:
             state.tp_stage = max(int(stage), state.tp_stage)
+            self.save()
+
+    def mark_be_scaled(self, code: str) -> None:
+        state = self._positions.get(self._norm(code))
+        if state:
+            state.be_scaled = True
+            self.save()
+
+    def note_exit_signal(self, code: str, key: str) -> int:
+        """같은 청산 신호가 연속으로 나온 횟수. 키가 바뀌면 1부터 다시."""
+        code = self._norm(code)
+        state = self._positions.get(code)
+        if state is None:
+            prev_key, prev_count = self._pending_exits.get(code, ("", 0))
+            count = prev_count + 1 if prev_key == key else 1
+            self._pending_exits[code] = (key, count)
+            return count
+        if state.pending_exit_key == key:
+            state.pending_exit_count += 1
+        else:
+            state.pending_exit_key = key
+            state.pending_exit_count = 1
+        self.save()
+        return state.pending_exit_count
+
+    def clear_exit_signal(self, code: str) -> None:
+        code = self._norm(code)
+        self._pending_exits.pop(code, None)
+        state = self._positions.get(code)
+        if state and (state.pending_exit_key or state.pending_exit_count):
+            state.pending_exit_key = ""
+            state.pending_exit_count = 0
             self.save()
 
     def remove(self, code: str) -> None:
