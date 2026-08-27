@@ -9,6 +9,8 @@ let selectedTradeCode = null;
 let tradedStocksCache = [];
 let chartRefreshTimer = null;
 let pendingCommand = null;
+let authBlocked = false;
+let refreshInFlight = false;
 
 const $ = (id) => document.getElementById(id);
 
@@ -27,16 +29,24 @@ function setToken(token) {
 }
 
 async function api(path, options = {}) {
+  const isLogin = String(path).startsWith("/api/auth/login");
+  if (authBlocked && !isLogin) {
+    throw new Error("로그인이 필요합니다.");
+  }
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   const token = getToken();
   if (token) headers.Authorization = `Bearer ${token}`;
   const res = await fetch(path, { ...options, headers });
-  if (res.status === 401) {
-    setToken(null);
-    show("login");
-    throw new Error("로그인이 필요합니다.");
-  }
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    if (!isLogin) {
+      authBlocked = true;
+      setToken(null);
+      stopChartAutoRefresh();
+      show("login");
+    }
+    throw new Error(data.detail || "로그인이 필요합니다.");
+  }
   if (!res.ok) {
     throw new Error(data.detail || `오류 (${res.status})`);
   }
@@ -59,6 +69,39 @@ function profitClass(pct) {
   if (pct > 0) return "profit-pos";
   if (pct < 0) return "profit-neg";
   return "";
+}
+
+function signedPct(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(2)}`;
+}
+
+function renderNewsSessions(data) {
+  const wrap = data && data.news_sessions;
+  $("news-session-date").textContent = wrap ? wrap.date : "—";
+  const sessions = (wrap && wrap.sessions) || {};
+  for (const [key, prefix] of [
+    ["morning", "news-morning"],
+    ["afternoon", "news-afternoon"],
+  ]) {
+    const sess = sessions[key] || {};
+    const valueEl = $(`${prefix}-value`);
+    const metaEl = $(`${prefix}-meta`);
+    if (!sess.count) {
+      valueEl.textContent = "기록 없음";
+      valueEl.className = "muted";
+      metaEl.textContent = "장중 자동점검이 쌓이면 표시됩니다";
+      continue;
+    }
+    valueEl.textContent = signedPct(sess.avg_sentiment);
+    valueEl.className = profitClass(sess.avg_sentiment);
+    const blockPct = Math.round((sess.block_ratio || 0) * 100);
+    metaEl.textContent =
+      `범위 ${signedPct(sess.min_sentiment)}~${signedPct(sess.max_sentiment)} · ` +
+      `${sess.count}회 · 매수중단 ${blockPct}%`;
+  }
 }
 
 function renderMonthlyPnlChart(byMonth) {
@@ -533,7 +576,8 @@ function renderDashboard(data) {
   $("error-banner").classList.add("hidden");
 
   const mode = `${data.trade_mode_label} · ${data.strategy_label}`;
-  $("meta-line").textContent = `${mode} · ${data.market_status}`;
+  const host = data.runtime_host ? ` · ${data.runtime_host}` : "";
+  $("meta-line").textContent = `${mode} · ${data.market_status}${host}`;
 
   if (data.deposit) {
     $("cash-value").textContent = `${data.deposit.cash_fmt}원`;
@@ -574,6 +618,8 @@ function renderDashboard(data) {
     reasons.appendChild(li);
   }
 
+  renderNewsSessions(data);
+
   if (data.holdings_error) {
     $("error-banner").textContent = data.holdings_error;
     $("error-banner").classList.remove("hidden");
@@ -595,6 +641,12 @@ function renderDashboard(data) {
 }
 
 async function refreshChartsOnly() {
+  if (authBlocked || !getToken()) {
+    stopChartAutoRefresh();
+    return;
+  }
+  if (refreshInFlight) return;
+  refreshInFlight = true;
   try {
     const data = await api("/api/dashboard");
     renderChart(data.holdings || []);
@@ -607,6 +659,8 @@ async function refreshChartsOnly() {
     $("chart-updated-at").textContent = `차트 ${new Date().toLocaleTimeString("ko-KR")}`;
   } catch {
     /* ignore background chart errors */
+  } finally {
+    refreshInFlight = false;
   }
 }
 
@@ -734,6 +788,7 @@ $("login-form").addEventListener("submit", async (e) => {
       body: JSON.stringify(body),
     });
     setToken(res.access_token);
+    authBlocked = false;
     show("dashboard");
     await loadDashboard(true);
     startChartAutoRefresh();
@@ -767,6 +822,7 @@ $("command-arg-input").addEventListener("keydown", (e) => {
 });
 
 $("logout-btn").addEventListener("click", () => {
+  authBlocked = true;
   stopChartAutoRefresh();
   setToken(null);
   show("login");

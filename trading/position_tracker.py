@@ -239,6 +239,18 @@ class PositionTracker:
         current = now or datetime.now()
         return (current - entry).total_seconds() / 60.0
 
+    def is_overnight(self, code: str, now: datetime | None = None) -> bool:
+        """진입일이 오늘보다 이전이면 전일 잔량(오버나잇)."""
+        state = self._positions.get(self._norm(code))
+        if state is None:
+            return False
+        try:
+            entry = datetime.fromisoformat(state.entry_time)
+        except ValueError:
+            return False
+        current = now or datetime.now()
+        return entry.date() < current.date()
+
     def mark_exit(self, code: str, now: datetime | None = None) -> None:
         """청산 시각 기록 (재진입 쿨다운용)."""
         current = now or datetime.now()

@@ -38,6 +38,48 @@ def test_risk_score_strong_korean_themes_can_be_high() -> None:
     assert score >= 0.70
 
 
+def test_geopolitics_english_rss_excluded_from_sentiment() -> None:
+    """지정학 영문 RSS의 war/sanction은 심리 점수에 넣지 않는다."""
+    analyzer = MarketNewsAnalyzer()
+    items = [
+        NewsItem(
+            category="지정학",
+            title="War sanctions Iran Hormuz geopolitical crisis missile",
+        ),
+        NewsItem(
+            category="지정학",
+            title="Israel invasion nuclear escalation",
+        ),
+        NewsItem(category="국내경제", title="반도체 실적 호조로 증시 반등 강세 성장"),
+        NewsItem(category="글로벌경제", title="Markets rally on recovery and rate cut hopes"),
+    ]
+    ctx = analyzer.analyze(items)
+    assert ctx.sentiment > 0
+    assert ctx.negative_hits == 0
+    assert any("[지정학]" in h for h in ctx.headlines)
+    assert ctx.risk_score > 0
+
+
+def test_geopolitics_only_headlines_leave_sentiment_neutral() -> None:
+    """지정학 피드만 있으면 심리는 0, 리스크는 남긴다."""
+    analyzer = MarketNewsAnalyzer()
+    items = [
+        NewsItem(
+            category="지정학",
+            title="War sanctions Iran Hormuz geopolitical crisis",
+        ),
+        NewsItem(
+            category="지정학",
+            title="Missile nuclear invasion escalation",
+        ),
+    ]
+    ctx = analyzer.analyze(items)
+    assert ctx.sentiment == 0.0
+    assert ctx.negative_hits == 0
+    assert ctx.positive_hits == 0
+    assert ctx.risk_score > 0
+
+
 def test_geopolitics_rss_noise_does_not_hard_block_buys() -> None:
     """지정학 RSS 노이즈만으로는 allow_buy가 False가 되지 않는다."""
     analyzer = MarketNewsAnalyzer()
@@ -164,26 +206,50 @@ def test_news_score_gate_is_secondary_penalty_not_hard_stop() -> None:
     assert "뉴스" in note
 
 
-def test_news_score_gate_hard_stop_only_on_extreme() -> None:
+def test_news_score_gate_chart_primary_blocks_sentiment_at_soft_threshold() -> None:
+    """차트우선이어도 심리 -0.70 이하면 신규매수를 막는다 (8/18 -0.88)."""
+    from trading.news_analyzer import MarketNewsContext
+
+    ctx = MarketNewsContext(
+        sentiment=-0.88,
+        risk_score=0.52,
+        allow_buy=True,
+        score_adjustment=-4.0,
+    )
+    hard_stop, _adjusted, note = news_score_gate(
+        base_score=25.0,
+        news=ctx,
+        min_score=19.0,
+    )
+    assert hard_stop is True
+    assert "중단" in note
+
+
+def test_news_score_gate_chart_primary_advisory_above_block_threshold() -> None:
+    from trading.news_analyzer import MarketNewsContext
+
+    ctx = MarketNewsContext(
+        sentiment=-0.40,
+        risk_score=0.30,
+        allow_buy=True,
+        score_adjustment=-4.0,
+    )
+    hard_stop, adjusted, note = news_score_gate(
+        base_score=25.0,
+        news=ctx,
+        min_score=19.0,
+    )
+    assert hard_stop is False
+    assert adjusted < 25.0
+    assert "참고" in note
+
+
+def test_news_score_gate_hard_stop_only_on_extreme(monkeypatch) -> None:
     from trading.news_analyzer import MarketNewsContext
     import trading.news_priority as np
 
-    # 차트 우선 모드에서는 극단 뉴스도 하드스톱하지 않는다
-    if np.chart_primary_mode:
-        ctx = MarketNewsContext(
-            sentiment=-0.95,
-            risk_score=0.85,
-            allow_buy=False,
-            score_adjustment=-4.0,
-        )
-        hard_stop, adjusted, note = news_score_gate(
-            base_score=25.0,
-            news=ctx,
-            min_score=19.0,
-        )
-        assert hard_stop is False
-        assert "참고" in note
-        return
+    monkeypatch.setattr(np, "chart_primary_mode", False)
+    monkeypatch.setattr(np, "news_filter_secondary", False)
 
     ctx = MarketNewsContext(
         sentiment=-0.95,

@@ -1,0 +1,16 @@
+.git
+.venv
+venv
+__pycache__
+*.pyc
+tests
+docs
+scripts
+*.md
+.pytest_cache
+config/config.py
+config/local_secrets.py
+config/cloudflared.yml
+data/positions.json
+data/trade_journal.jsonl
+data/news_sentiment.jsonl

@@ -106,6 +106,7 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
         "journal_stats": None,
         "daily_summary": None,
         "account_summary": None,
+        "news_sessions": None,
     }
 
     try:
@@ -200,5 +201,12 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
         snapshot["account_summary"] = acct
     except OSError:
         snapshot["account_summary"] = None
+
+    try:
+        from trading.news_sentiment_log import build_session_summary
+
+        snapshot["news_sessions"] = build_session_summary()
+    except OSError:
+        snapshot["news_sessions"] = None
 
     return snapshot

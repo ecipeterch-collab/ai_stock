@@ -17,7 +17,7 @@ use_paper = True
 dmst_stex_tp = "KRX"  # 주문: KRX | NXT | SOR (모의투자는 KRX만)
 # 키움 REST API (2026-06 ATS/NXT·통합 시세 반영)
 kiwoom_rank_stex_tp = "3"  # 거래대금순위: 1=KRX 2=NXT 3=통합
-kiwoom_execution_stex_tp = "0"  # 체결조회: 0=통합 1=KRX 2=NXT
+kiwoom_execution_stex_tp = "0"  # 실전 체결조회: 0=통합 1=KRX 2=NXT (모의는 코드에서 KRX 고정)
 kiwoom_chart_exchange = "KRX"  # 차트: KRX | NXT | SOR(통합=_AL 접미사)
 kiwoom_paper_min_request_interval_sec = 1.05
 kiwoom_real_min_request_interval_sec = 0.21
@@ -158,6 +158,7 @@ strategy_block_etf = True  # KODEX/TIGER 등 일반 ETF·ETN 전체 자동매수
 strategy_block_leveraged_etf = True  # block_etf=False 일 때만 레버리지/인버스만 제외
 strategy_defensive_min_hold_minutes = 45
 strategy_defensive_trailing_min_peak_pct = 3.0
+strategy_defensive_skip_overnight = True  # 전일 잔량은 방어모드 제외, 손절만
 strategy_reentry_cooldown_minutes = 45
 strategy_trend_max_buys_per_day = 5
 
@@ -247,14 +248,19 @@ drawdown_scale_channel_boost = ("crash",)
 drawdown_scale_momentum_mult_cap = 1.0
 
 notify_on_auto_events_only = True
+# 체결·잔고 조회 실패 텔레그램 반복 알림 간격(초). 같은 오류는 이 시간 동안 생략.
+api_error_notify_cooldown_sec = 1800
 
 # Web dashboard (run_web.py) — 외부 접속 시 반드시 강한 비밀번호·HTTPS/VPN 사용
 # Tailscale Serve / Caddy 사용 시 127.0.0.1 권장 (docs/REMOTE_ACCESS.md)
 web_host = "127.0.0.1"
 web_port = 8081  # ai_coin(8080)과 동시 실행 — docs/MULTI_APP.md
 web_token_expire_hours = 24
-web_tunnel_enabled = True
+web_tunnel_enabled = True  # OCI 실서비스는 False (nginx+Cloudflare). 이 PC 개발용만 True
 web_tunnel_provider = "cloudflared"  # cloudflared | ngrok
+# 고정 URL (named tunnel). 비우면 trycloudflare 임시 주소가 재시작마다 바뀜.
+web_public_url = "https://stock.jhunnet.com"
+web_tunnel_name = "ai-stock"  # scripts/setup-named-tunnel.ps1 로 생성
 
 trend_auto_buy_enabled = False  # 트렌드 채널 공회전 방지 (모멘텀·차트 집중)
 trend_min_theme_hits = 2

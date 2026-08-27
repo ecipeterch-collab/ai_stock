@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from config.config import (
+    news_block_buy_sentiment,
     news_block_buy_sentiment_hard,
     news_filter_secondary,
     news_override_allow_buy_sentiment_floor,
@@ -57,7 +58,7 @@ def news_score_gate(
     news: MarketNewsContext | None,
     min_score: float = 0.0,
 ) -> tuple[bool, float, str]:
-    """뉴스 게이트. 차트 우선·차순위에서는 하드 스톱 없음."""
+    """뉴스 게이트. 차트 우선은 심리 소프트 차단 이하만 하드 스톱."""
     del min_score
     if news is None:
         return False, base_score, ""
@@ -66,6 +67,13 @@ def news_score_gate(
     note_parts: list[str] = []
 
     if chart_primary_mode:
+        if news.sentiment <= news_block_buy_sentiment:
+            return (
+                True,
+                adjusted,
+                f"뉴스 심리 중단 (심리 {news.sentiment:+.2f}"
+                f" ≤ {news_block_buy_sentiment:+.2f})",
+            )
         if news.score_adjustment:
             note_parts.append(
                 f"뉴스참고 {news.score_adjustment:+.1f}"

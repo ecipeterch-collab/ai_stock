@@ -17,4 +17,6 @@ telegram_token = "YOUR_TELEGRAM_BOT_TOKEN"
 web_username = "admin"
 web_password = "CHANGE_ME_STRONG_PASSWORD"
 web_secret_key = "CHANGE_ME_RANDOM_32_CHARS_OR_MORE"
+# 선택: Cloudflare named tunnel 토큰 (Zero Trust 대시보드). 비우면 web_tunnel_name + config/cloudflared.yml 사용.
+web_tunnel_token = ""
 

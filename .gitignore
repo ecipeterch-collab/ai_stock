@@ -10,6 +10,7 @@ venv/
 # Secrets (use config/config.example.py as template)
 config/config.py
 config/local_secrets.py
+config/cloudflared.yml
 *_appkey.txt
 *_secretkey.txt
 66476338_*.txt
@@ -17,6 +18,7 @@ config/local_secrets.py
 # Runtime data
 data/positions.json
 data/trade_journal.jsonl
+data/news_sentiment.jsonl
 
 # IDE (optional local settings)
 .vscode/

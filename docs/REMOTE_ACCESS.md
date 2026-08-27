@@ -1,6 +1,9 @@
 # 폰·외부에서 웹 대시보드 접속 (Tailscale / HTTPS)
 
-웹 대시보드(`run_web.py`)는 키움 API 키가 있는 PC에서 동작합니다. **인터넷에 포트만 열고 쓰지 마세요.** 아래 두 방법 중 하나를 권장합니다.
+**실서비스:** 오라클 매매 VM + Cloudflare `https://stock.jhunnet.com` — [OCI_PRODUCTION.md](OCI_PRODUCTION.md).  
+이 문서는 **이 PC에서 개발·디버그할 때** 대시보드를 여는 방법입니다. 서버가 실매매 중이면 같은 앱키로 PC `auto_trade.py` 를 켜지 마세요.
+
+웹 대시보드(`run_web.py`)를 PC에서 띄울 때 **인터넷에 포트만 열고 쓰지 마세요.** 아래 두 방법 중 하나를 권장합니다.
 
 | 방법 | 난이도 | HTTPS | 적합한 경우 |
 |------|--------|-------|-------------|
@@ -34,8 +37,18 @@ web_secret_key = "32자이상_임의문자열"
 python run_web.py
 ```
 
-`web_tunnel_enabled = True`(기본)이면 **cloudflared**로 외부 HTTPS URL이 자동 출력됩니다.
-(재시작마다 `trycloudflare.com` 주소 변경 — ai_coin과 별도 터널)
+`web_tunnel_enabled = True`(기본)이면 **cloudflared**로 외부 HTTPS가 붙습니다.
+
+**개발 PC 고정 URL (cloudflared):** `https://stock.jhunnet.com` — 실서비스 컷오버 후에는 DNS가 OCI origin을 가리키므로 PC 터널을 끄세요.
+
+```powershell
+.\scripts\setup-named-tunnel.ps1
+python run_web.py
+```
+
+한 번 만들어 두면 재시작해도 주소가 바뀌지 않습니다. `web_public_url` / `web_tunnel_name` 은 `config/config.py` 에 둡니다.
+
+임시 `trycloudflare.com` 주소는 `web_public_url` 과 `web_tunnel_name` 을 비울 때만 쓰며, 그때는 재시작마다 URL이 바뀝니다.
 
 설치: `winget install Cloudflare.cloudflared`
 

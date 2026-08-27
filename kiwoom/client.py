@@ -36,6 +36,18 @@ class KiwoomAPIError(RuntimeError):
     pass
 
 
+# 키움 서버 일시 처리 실패. HTTP 429와 달리 return_code로 오며 재시도하면 곧잘 성공한다.
+_TRANSIENT_RETURN_CODES = {4007, "4007"}
+_TRANSIENT_RETRY_COUNT = 2
+
+
+def _is_transient_kiwoom_error(body: dict) -> bool:
+    if body.get("return_code") in _TRANSIENT_RETURN_CODES:
+        return True
+    msg = str(body.get("return_msg") or "")
+    return "[4007]" in msg
+
+
 _clients: dict[bool, "KiwoomClient"] = {}
 _clients_lock = threading.Lock()
 
@@ -170,51 +182,62 @@ class KiwoomClient:
         next_key: str = "",
     ) -> tuple[dict, dict]:
         with self._lock:
-            self._throttle()
-            token = self._ensure_token()
             last_exc: Exception | None = None
-            for attempt in range(5):
-                response = requests.post(
-                    self.host + endpoint,
-                    headers={
-                        "Content-Type": "application/json;charset=UTF-8",
-                        "authorization": f"Bearer {token}",
-                        "cont-yn": cont_yn,
-                        "next-key": next_key,
-                        "api-id": api_id,
-                    },
-                    json=data or {},
-                    timeout=30,
-                )
-                if response.status_code == 429:
-                    wait = min(2 ** attempt, 8)
-                    last_exc = requests.HTTPError(
-                        f"{api_id} 호출 제한(429), {wait}초 후 재시도",
-                        response=response,
+            token: str | None = None
+            transient_attempts = 0
+            while True:
+                self._throttle()
+                if token is None:
+                    token = self._ensure_token()
+                for attempt in range(5):
+                    response = requests.post(
+                        self.host + endpoint,
+                        headers={
+                            "Content-Type": "application/json;charset=UTF-8",
+                            "authorization": f"Bearer {token}",
+                            "cont-yn": cont_yn,
+                            "next-key": next_key,
+                            "api-id": api_id,
+                        },
+                        json=data or {},
+                        timeout=30,
                     )
-                    time.sleep(wait)
-                    if attempt >= 2:
-                        token = self._issue_token()
-                    continue
-                break
-            else:
-                if last_exc:
-                    raise last_exc
-                raise KiwoomAPIError(f"{api_id} 호출 제한(429)")
-            self._last_request_at = time.monotonic()
-            response.raise_for_status()
-            body = response.json()
-            headers = {
-                "cont-yn": response.headers.get("cont-yn", "N"),
-                "next-key": response.headers.get("next-key", ""),
-                "api-id": response.headers.get("api-id", api_id),
-            }
-            if body.get("return_code", 0) != 0:
-                raise KiwoomAPIError(
-                    f"{api_id} 오류: {body.get('return_msg')} "
-                    f"({json.dumps(body, ensure_ascii=False)})"
-                )
-            return body, headers
+                    if response.status_code == 429:
+                        wait = min(2 ** attempt, 8)
+                        last_exc = requests.HTTPError(
+                            f"{api_id} 호출 제한(429), {wait}초 후 재시도",
+                            response=response,
+                        )
+                        time.sleep(wait)
+                        if attempt >= 2:
+                            token = self._issue_token()
+                        continue
+                    break
+                else:
+                    if last_exc:
+                        raise last_exc
+                    raise KiwoomAPIError(f"{api_id} 호출 제한(429)")
+                self._last_request_at = time.monotonic()
+                response.raise_for_status()
+                body = response.json()
+                headers = {
+                    "cont-yn": response.headers.get("cont-yn", "N"),
+                    "next-key": response.headers.get("next-key", ""),
+                    "api-id": response.headers.get("api-id", api_id),
+                }
+                if body.get("return_code", 0) != 0:
+                    if (
+                        _is_transient_kiwoom_error(body)
+                        and transient_attempts < _TRANSIENT_RETRY_COUNT
+                    ):
+                        transient_attempts += 1
+                        time.sleep(min(2 ** (transient_attempts - 1), 4))
+                        continue
+                    raise KiwoomAPIError(
+                        f"{api_id} 오류: {body.get('return_msg')} "
+                        f"({json.dumps(body, ensure_ascii=False)})"
+                    )
+                return body, headers
 
     def post_all(self, endpoint: str, api_id: str, data: dict | None = None) -> dict:
         merged: dict[str, Any] = {}
@@ -336,6 +359,14 @@ class KiwoomClient:
         body, _ = self.post(ACNT_ENDPOINT, "kt00001", {"qry_tp": "3"})
         return body
 
+    def _resolve_execution_stex(self, stex_tp: str | None = None) -> str:
+        """체결조회 거래소. 모의는 KRX(1)만, 실전은 config 또는 명시값."""
+        if self.paper:
+            return "1"
+        if stex_tp:
+            return stex_tp
+        return kiwoom_execution_stex_tp
+
     def get_executions(
         self,
         *,
@@ -345,8 +376,8 @@ class KiwoomClient:
         sell_tp: str = "0",
         stex_tp: str | None = None,
     ) -> list[dict]:
-        """체결 내역 조회 (ka10076). stex_tp: 0=통합, 1=KRX, 2=NXT."""
-        resolved_stex = stex_tp if stex_tp is not None else kiwoom_execution_stex_tp
+        """체결 내역 조회 (ka10076). stex_tp: 0=통합, 1=KRX, 2=NXT. 모의는 KRX 고정."""
+        resolved_stex = self._resolve_execution_stex(stex_tp)
         params = {
             "stk_cd": self.normalize_stock_code(stk_cd) if stk_cd else "",
             "qry_tp": qry_tp,

@@ -8,7 +8,7 @@ from config.config import (
     strategy_momentum_buy_enabled,
 )
 from trading.market_regime import RegimeSnapshot, is_channel_allowed
-from trading.scoring import CandidateView, is_market_bullish, score_candidate
+from trading.scoring import CandidateView, is_market_bullish, is_momentum_candidate, score_candidate
 from trading.symbol_filters import is_etf, is_leveraged_etf
 
 
@@ -70,6 +70,21 @@ def chart_primary_channel_flags(
             allow_momentum = False
         allow_pullback = is_channel_allowed(snap, "pullback")
     return allow_momentum, allow_pullback
+
+
+def chart_modes_for_candidate(
+    candidate: CandidateView,
+    *,
+    allow_momentum: bool,
+    allow_pullback: bool,
+) -> list[bool]:
+    """종목별 차트 모드. True=모멘텀(+2~+4% 러너만), False=눌림."""
+    modes: list[bool] = []
+    if allow_pullback:
+        modes.append(False)
+    if allow_momentum and is_momentum_candidate(candidate):
+        modes.append(True)
+    return modes
 
 
 def build_buy_advisory_notes(

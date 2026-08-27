@@ -37,6 +37,9 @@ NEWS_QUERIES: dict[str, str] = {
     "지정학": "geopolitical conflict war sanctions oil",
 }
 
+# 지정학 영문 RSS는 브리핑·리스크용. war/sanction 상시 노출을 심리 점수에 넣지 않는다.
+SENTIMENT_EXCLUDED_CATEGORIES = frozenset({"지정학"})
+
 POSITIVE_KEYWORDS = [
     "금리인하",
     "인하",
@@ -398,8 +401,9 @@ class MarketNewsAnalyzer:
             item_pos = self._count_keyword_hits(text, POSITIVE_KEYWORDS)
             item_neg = self._count_keyword_hits(text, NEGATIVE_KEYWORDS)
             item_risk = self._count_keyword_hits(text, RISK_KEYWORDS)
-            pos_hits.extend(item_pos)
-            neg_hits.extend(item_neg)
+            if item.category not in SENTIMENT_EXCLUDED_CATEGORIES:
+                pos_hits.extend(item_pos)
+                neg_hits.extend(item_neg)
             risk_hits.extend(item_risk)
             if item_pos or item_neg or item_risk:
                 priority_titles.add(item.title)
@@ -449,6 +453,13 @@ class MarketNewsAnalyzer:
         if headlines is None:
             self._cache = ctx
             self._cache_ts = time.time()
+            if not ctx.error:
+                try:
+                    from trading.news_sentiment_log import append_snapshot
+
+                    append_snapshot(ctx)
+                except OSError:
+                    pass
         return ctx
 
     def get_context(self) -> MarketNewsContext:

@@ -65,6 +65,7 @@ from config.config import (
     strategy_block_etf,
     strategy_block_leveraged_etf,
     strategy_defensive_min_hold_minutes,
+    strategy_defensive_skip_overnight,
     strategy_defensive_trailing_min_peak_pct,
     strategy_weak_market_min_bullish_count,
     strategy_weak_market_sentiment,
@@ -133,6 +134,10 @@ from config.config import (
     regime_scan_top,
     drawdown_benchmark_code,
 )
+try:
+    from config.config import api_error_notify_cooldown_sec as api_error_notify_cooldown_sec
+except ImportError:
+    api_error_notify_cooldown_sec = 1800.0
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from trading.market_utils import (
     calc_profit_pct,
@@ -150,6 +155,7 @@ from trading.chart_primary import (
     advisory_market_note,
     advisory_strategy_score,
     build_buy_advisory_notes,
+    chart_modes_for_candidate,
     chart_primary_channel_flags,
     filter_chart_primary_universe,
 )
@@ -222,6 +228,33 @@ def is_event_message(message: str) -> bool:
     return message.startswith(EVENT_PREFIXES)
 
 
+def throttle_error_event(
+    state: dict[str, dict],
+    bucket: str,
+    message: str,
+    *,
+    now: float,
+    cooldown_sec: float,
+) -> str | None:
+    """같은 조회 오류는 cooldown 동안 한 번만 알린다. 재알림 시 생략 횟수를 붙인다."""
+    slot = state.setdefault(bucket, {"key": "", "at": 0.0, "suppressed": 0})
+    cooldown = max(0.0, float(cooldown_sec))
+    if slot["key"] == message and (now - float(slot["at"])) < cooldown:
+        slot["suppressed"] = int(slot["suppressed"]) + 1
+        return None
+    skipped = int(slot["suppressed"] or 0)
+    slot["key"] = message
+    slot["at"] = now
+    slot["suppressed"] = 0
+    if skipped:
+        return f"{message}\n(동일 오류 {skipped}회 생략)"
+    return message
+
+
+def clear_error_event_bucket(state: dict[str, dict], bucket: str) -> None:
+    state.pop(bucket, None)
+
+
 @dataclass
 class AutoRunResult:
     events: list[str] = field(default_factory=list)
@@ -281,6 +314,7 @@ class AutoTradingStrategy:
         self.chart = ChartSignalAnalyzer(client)
         self._drawdown = DrawdownScaleCalculator(client)
         self._cycle_ctx: MarketContext | None = None
+        self._error_notify_state: dict[str, dict] = {}
         self._seed_seen_fills_from_journal()
 
     def _seed_seen_fills_from_journal(self) -> None:
@@ -346,12 +380,7 @@ class AutoTradingStrategy:
         Returns:
             (candidate, total_score, chart_result, used_momentum)
         """
-        modes: list[bool] = []
-        if allow_pullback:
-            modes.append(False)
-        if allow_momentum:
-            modes.append(True)
-        if not modes:
+        if not allow_momentum and not allow_pullback:
             return None
         limit = max(
             1,
@@ -365,6 +394,11 @@ class AutoTradingStrategy:
 
         best: tuple[CandidateView, float, ChartSignalResult, bool] | None = None
         for cand in pool:
+            modes = chart_modes_for_candidate(
+                cand,
+                allow_momentum=allow_momentum,
+                allow_pullback=allow_pullback,
+            )
             for momentum in modes:
                 chart = self.chart.evaluate_candidate(cand, momentum=momentum)
                 if not chart.passed:
@@ -1030,6 +1064,8 @@ class AutoTradingStrategy:
             + "■ 연속손실 브레이커: 3회→60분 / 5회→당일중지\n"
             + (
                 "■ 국면감지: 참고/알림 (매수 하드게이트 아님)\n"
+                "■ 차트우선: 모멘텀 차트는 +2~+4% 러너만 · 뉴스 심리 -0.70 이하면 매수중단\n"
+                "■ 방어모드: 당일 포지션만 (오버나잇은 손절)\n"
                 if chart_primary_mode and regime_enabled
                 else (
                     "■ 국면감지: 강세(모멘텀·눌림·추가) / 횡보(추가만) / "
@@ -1048,7 +1084,16 @@ class AutoTradingStrategy:
         )
 
     def get_news_briefing(self) -> str:
-        return self.news.get_context().summary_message()
+        live = self.news.get_context().summary_message()
+        try:
+            from trading.news_sentiment_log import format_session_summary_text
+
+            sessions = format_session_summary_text()
+        except OSError:
+            sessions = ""
+        if sessions:
+            return live + "\n\n" + sessions
+        return live
 
     def get_trend_report(self) -> str:
         return self.trends.scan().format_intro()
@@ -1309,12 +1354,24 @@ class AutoTradingStrategy:
             return False
         return since < float(self._position_sync_grace_minutes())
 
+    def _add_throttled_error(self, result: AutoRunResult, bucket: str, message: str) -> None:
+        text = throttle_error_event(
+            self._error_notify_state,
+            bucket,
+            message,
+            now=time.monotonic(),
+            cooldown_sec=float(api_error_notify_cooldown_sec),
+        )
+        if text:
+            result.add_event(text)
+
     def _collect_new_fills(self, result: AutoRunResult) -> None:
         try:
             fills = self.client.get_executions()
         except (KiwoomAPIError, requests.RequestException) as exc:
-            result.add_event(f"체결 조회 실패: {exc}")
+            self._add_throttled_error(result, "fills", f"체결 조회 실패: {exc}")
             return
+        clear_error_event_bucket(self._error_notify_state, "fills")
         for fill in fills:
             key = self._fill_key(fill)
             if key in self._seen_fill_keys:
@@ -1648,6 +1705,11 @@ class AutoTradingStrategy:
                 return label, be_qty, None
 
         if news and news.defensive_mode:
+            skip_overnight = (
+                strategy_defensive_skip_overnight
+                and not is_scalping_mode()
+                and self.positions.is_overnight(holding.code)
+            )
             hold_min = self.positions.holding_minutes(holding.code)
             min_def_hold = (
                 0
@@ -1659,7 +1721,7 @@ class AutoTradingStrategy:
                 and hold_min is not None
                 and hold_min < min_def_hold
             )
-            if not in_grace:
+            if not skip_overnight and not in_grace:
                 if profit <= news_defensive_loss_pct:
                     return (
                         f"방어모드 매도 (뉴스 악화, 수익 {profit:.2f}%)",
@@ -1912,8 +1974,9 @@ class AutoTradingStrategy:
         try:
             if holdings is None:
                 holdings = self._parse_holdings()
+            clear_error_event_bucket(self._error_notify_state, "holdings_sell")
         except (KiwoomAPIError, requests.RequestException) as exc:
-            result.add_event(f"잔고 조회 실패(매도): {exc}")
+            self._add_throttled_error(result, "holdings_sell", f"잔고 조회 실패(매도): {exc}")
             return 0
 
         top_volume_codes: set[str] = set()
@@ -2205,7 +2268,7 @@ class AutoTradingStrategy:
             result.add_report(self._heartbeat(heat))
             return
 
-        # 차트 우선: 국면·강세·등락·점수·뉴스는 참고만, 차트가 매수 본결정
+        # 차트 우선: 국면·점수·뉴스는 참고. 심리 ≤ news_block_buy_sentiment 는 매수 중단.
         if chart_primary_mode and not is_scalping_mode():
             self._run_chart_primary_buy(
                 result,
@@ -2465,11 +2528,16 @@ class AutoTradingStrategy:
             return
 
         best, adjusted, chart_result, used_momentum = picked
-        _, adjusted, news_gate_note = news_score_gate(
+        hard_stop, adjusted, news_gate_note = news_score_gate(
             base_score=adjusted,
             news=news,
             min_score=0.0,
         )
+        if hard_stop:
+            result.add_report(
+                self._heartbeat(news_gate_note or "차트우선 - 뉴스 심리 중단")
+            )
+            return
         strat_score = advisory_strategy_score(best, momentum=used_momentum)
         advisory = build_buy_advisory_notes(
             candidate=best,
@@ -3015,8 +3083,9 @@ class AutoTradingStrategy:
 
             try:
                 holdings = self._parse_holdings()
+                clear_error_event_bucket(self._error_notify_state, "holdings")
             except (KiwoomAPIError, requests.RequestException) as exc:
-                result.add_event(f"잔고 조회 실패: {exc}")
+                self._add_throttled_error(result, "holdings", f"잔고 조회 실패: {exc}")
                 holdings = None
 
             if holdings is not None:

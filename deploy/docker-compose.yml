@@ -1,0 +1,25 @@
+services:
+  bot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    working_dir: /app
+    command: ["python", "auto_trade.py"]
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      - ..:/app
+    restart: unless-stopped
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    working_dir: /app
+    command: ["python", "run_web.py"]
+    environment:
+      TZ: Asia/Seoul
+    volumes:
+      - ..:/app
+    ports:
+      - "127.0.0.1:8081:8081"
+    restart: unless-stopped

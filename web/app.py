@@ -1,20 +1,29 @@
 from __future__ import annotations
 
 import logging
+import socket
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
 try:
-    from config.config import web_port, web_tunnel_enabled, web_tunnel_provider
+    from config import config as _web_cfg
+
+    web_port = getattr(_web_cfg, "web_port", 8081)
+    web_tunnel_enabled = getattr(_web_cfg, "web_tunnel_enabled", True)
+    web_tunnel_provider = getattr(_web_cfg, "web_tunnel_provider", "cloudflared")
+    web_public_url = getattr(_web_cfg, "web_public_url", "")
+    web_tunnel_name = getattr(_web_cfg, "web_tunnel_name", "")
 except ImportError:
     web_port = 8081
     web_tunnel_enabled = True
     web_tunnel_provider = "cloudflared"
+    web_public_url = ""
+    web_tunnel_name = ""
 from trading.dashboard_data import build_dashboard_snapshot
 from trading.account_pnl import build_account_summary, format_account_summary_text
 from trading.journal_stats import build_daily_summary, build_journal_stats
@@ -28,12 +37,27 @@ logger = logging.getLogger(__name__)
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
 
+class DropUnauthDashboardAccessFilter(logging.Filter):
+    """로그인 전 차트 폴링이 남기는 GET /api/dashboard 401 액세스 로그를 숨긴다."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("GET /api/dashboard" in msg and "401" in msg)
+
+
+def install_access_log_filters() -> None:
+    access = logging.getLogger("uvicorn.access")
+    if not any(isinstance(f, DropUnauthDashboardAccessFilter) for f in access.filters):
+        access.addFilter(DropUnauthDashboardAccessFilter())
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 봇·자동매매 루프 초기화 (runtime_settings.auto_trading_enabled 복원)
     from web.commands import _get_bot
 
     _get_bot()
+    install_access_log_filters()
 
     if web_tunnel_enabled:
         def on_url(url: str) -> None:
@@ -61,16 +85,28 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        path = request.url.path
+        if path == "/" or path.startswith("/static/"):
+            response.headers["Cache-Control"] = "no-cache, must-revalidate"
         return response
 
 
 app.add_middleware(SecurityHeadersMiddleware)
 
 
+def runtime_host() -> str:
+    return socket.gethostname()
+
+
 @app.api_route("/api/health", methods=["GET", "HEAD"])
 def health() -> dict:
     url = get_external_url()
-    return {"ok": True, "external_url": url, "tunnel_enabled": web_tunnel_enabled}
+    return {
+        "ok": True,
+        "host": runtime_host(),
+        "external_url": url,
+        "tunnel_enabled": web_tunnel_enabled,
+    }
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
@@ -83,6 +119,7 @@ def login(body: LoginRequest, request: Request) -> TokenResponse:
 def dashboard(_user: str = Depends(require_user)) -> dict:
     data = build_dashboard_snapshot()
     data["external_url"] = get_external_url()
+    data["runtime_host"] = runtime_host()
     return data
 
 
@@ -144,10 +181,26 @@ async def runtime_config_error(_request: Request, exc: RuntimeError):
     return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
+def render_index_html() -> str:
+    """index.html 에 JS/CSS mtime 쿼리를 붙여 브라우저 캐시를 무효화한다."""
+    html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    js_v = int((STATIC_DIR / "app.js").stat().st_mtime)
+    css_v = int((STATIC_DIR / "styles.css").stat().st_mtime)
+    return html.replace(
+        'href="/static/styles.css"',
+        f'href="/static/styles.css?v={css_v}"',
+        1,
+    ).replace(
+        'src="/static/app.js"',
+        f'src="/static/app.js?v={js_v}"',
+        1,
+    )
+
+
 @app.api_route("/", methods=["GET", "HEAD"])
 def index():
     """대시보드 HTML. HEAD는 터널·프리페치 헬스체크용(405 방지)."""
-    return FileResponse(STATIC_DIR / "index.html")
+    return HTMLResponse(render_index_html())
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

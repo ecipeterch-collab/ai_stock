@@ -1,0 +1,7 @@
+# Copy to config/cloudflared.yml (gitignored) via scripts/setup-named-tunnel.ps1
+tunnel: ai-stock
+credentials-file: C:\Users\Windows11\.cloudflared\TUNNEL_ID.json
+ingress:
+  - hostname: stock.jhunnet.com
+    service: http://127.0.0.1:8081
+  - service: http_status:404

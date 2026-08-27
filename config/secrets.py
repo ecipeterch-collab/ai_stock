@@ -15,6 +15,7 @@ class Secrets:
     web_username: str
     web_password: str
     web_secret_key: str
+    web_tunnel_token: str = ""
 
 
 def _env(name: str, default: str = "") -> str:
@@ -37,6 +38,7 @@ def load_secrets() -> Secrets:
             "web_username": getattr(_local, "web_username", ""),
             "web_password": getattr(_local, "web_password", ""),
             "web_secret_key": getattr(_local, "web_secret_key", ""),
+            "web_tunnel_token": getattr(_local, "web_tunnel_token", ""),
         }
     except Exception:
         local = {}
@@ -64,5 +66,6 @@ def load_secrets() -> Secrets:
         web_username=_env("WEB_USERNAME", local.get("web_username", "")),
         web_password=_env("WEB_PASSWORD", local.get("web_password", "")),
         web_secret_key=_env("WEB_SECRET_KEY", local.get("web_secret_key", "")),
+        web_tunnel_token=_env("WEB_TUNNEL_TOKEN", local.get("web_tunnel_token", "")),
     )
 

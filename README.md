@@ -26,6 +26,9 @@ copy config\local_secrets.example.py config\local_secrets.py
 | `python run_web.py` | 웹 대시보드 (폰·외부 조회, JWT 로그인) |
 | `python send-test.py` | 텔레그램 발송 테스트 |
 | `python chat-test.py` | 텔레그램 에코 봇 |
+| `.\scripts\deploy-oci.ps1` | 오라클 매매 VM에 `git pull` 후 재시작 ([docs/OCI_PRODUCTION.md](docs/OCI_PRODUCTION.md)) |
+
+실서비스(장중 자동매매·`https://stock.jhunnet.com`)는 **오라클 VM**에서 돌립니다. 이 PC는 디버그·기능 구현용입니다. 같은 키움 앱키로 PC와 서버에서 `auto_trade.py` 를 동시에 켜지 마세요.
 
 ## 텔레그램 명령 (요약)
 
