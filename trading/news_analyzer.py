@@ -37,7 +37,7 @@ NEWS_QUERIES: dict[str, str] = {
     "지정학": "geopolitical conflict war sanctions oil",
 }
 
-# 지정학 영문 RSS는 브리핑·리스크용. war/sanction 상시 노출을 심리 점수에 넣지 않는다.
+# 지정학 영문 RSS는 브리핑용. war/sanction 상시 노출을 심리·리스크 점수에 넣지 않는다.
 SENTIMENT_EXCLUDED_CATEGORIES = frozenset({"지정학"})
 
 POSITIVE_KEYWORDS = [
@@ -404,7 +404,7 @@ class MarketNewsAnalyzer:
             if item.category not in SENTIMENT_EXCLUDED_CATEGORIES:
                 pos_hits.extend(item_pos)
                 neg_hits.extend(item_neg)
-            risk_hits.extend(item_risk)
+                risk_hits.extend(item_risk)
             if item_pos or item_neg or item_risk:
                 priority_titles.add(item.title)
 

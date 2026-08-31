@@ -106,7 +106,25 @@ position_addon_momentum_min_peak_pct = 0.5
 position_addon_max_per_day = 2
 position_addon_max_qty_multiplier = 3.0
 
-strategy_stop_loss_pct = 4.0  # 손절 (%) — 보유 중심
+strategy_stop_loss_pct = 4.0  # 시총 대형 손절 (%)
+# 고정 시총 대형 유니버스 — 이 종목만 오버나잇·넓은 손절·본전스탑
+mega_cap_codes = (
+    "005930",  # 삼성전자
+    "005935",  # 삼성전자우
+    "000660",  # SK하이닉스
+    "005380",  # 현대차
+    "000270",  # 기아
+    "035420",  # NAVER
+    "068270",  # 셀트리온
+    "105560",  # KB금융
+    "055550",  # 신한지주
+    "373220",  # LG에너지솔루션
+)
+strategy_other_stop_loss_pct = 2.5
+strategy_other_trail_activate_pct = 1.5
+strategy_other_trail_drawdown_pct = 1.0
+strategy_other_eod_sell_all = True
+strategy_other_flatten_overnight = True
 # 아침 모멘텀 채널: 장 초반 순위 급등 + 상승 중 종목 허용 (러너 포착)
 strategy_momentum_buy_enabled = True
 strategy_momentum_window_end = "10:00"
@@ -206,7 +224,7 @@ news_defensive_sell_sentiment = -0.45
 news_force_reduce_risk_score = 0.75
 news_score_boost_positive = 3.0
 news_score_penalty_negative = -4.0
-news_defensive_loss_pct = -0.5
+news_defensive_loss_pct = -2.0
 
 news_override_when_market_bullish = True
 # 강세장 오버라이드는 키워드 리스크 점수와 무관 (지정학 RSS 노이즈 대응)

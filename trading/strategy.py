@@ -106,9 +106,6 @@ from config.config import (
     strategy_reentry_cooldown_minutes,
     strategy_swing_eod_sell_all,
     strategy_swing_eod_sell_if_below_pct,
-    strategy_swing_take_profit_pct,
-    strategy_swing_top_volume_tp1_pct,
-    strategy_swing_top_volume_tp2_pct,
     strategy_swing_trailing_activate_pct,
     strategy_swing_trailing_drawdown_pct,
     strategy_trend_max_buys_per_day,
@@ -138,6 +135,26 @@ try:
     from config.config import api_error_notify_cooldown_sec as api_error_notify_cooldown_sec
 except ImportError:
     api_error_notify_cooldown_sec = 1800.0
+try:
+    from config.config import strategy_other_stop_loss_pct as strategy_other_stop_loss_pct
+except ImportError:
+    strategy_other_stop_loss_pct = 2.5
+try:
+    from config.config import strategy_other_trail_activate_pct as strategy_other_trail_activate_pct
+except ImportError:
+    strategy_other_trail_activate_pct = 1.5
+try:
+    from config.config import strategy_other_trail_drawdown_pct as strategy_other_trail_drawdown_pct
+except ImportError:
+    strategy_other_trail_drawdown_pct = 1.0
+try:
+    from config.config import strategy_other_eod_sell_all as strategy_other_eod_sell_all
+except ImportError:
+    strategy_other_eod_sell_all = True
+try:
+    from config.config import strategy_other_flatten_overnight as strategy_other_flatten_overnight
+except ImportError:
+    strategy_other_flatten_overnight = True
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from trading.market_utils import (
     calc_profit_pct,
@@ -148,6 +165,8 @@ from trading.market_utils import (
 )
 from trading.journal_stats import build_daily_summary, format_daily_summary_text
 from trading.account_pnl import build_account_summary, format_account_summary_text
+from trading.account_settings import round_trip_cost_pct
+from trading.mega_cap import is_mega_cap
 from trading.position_tracker import PositionState, PositionTracker
 from trading.news_analyzer import MarketNewsAnalyzer, MarketNewsContext
 from trading.news_priority import apply_bullish_news_override, news_score_gate
@@ -750,6 +769,8 @@ class AutoTradingStrategy:
             return max(1, int(default_order_qty))
         if scale_mult > 0 and scale_mult != 1.0:
             target = int(target * scale_mult)
+        if int(price) > target:
+            return 0
         qty = target // int(price)
         qty = max(int(position_min_qty), int(qty))
         qty = min(int(position_max_qty), qty)
@@ -824,6 +845,21 @@ class AutoTradingStrategy:
         if p < 500_000:
             return 500
         return 1_000
+
+    @staticmethod
+    def _exit_uses_market(reason: str) -> bool:
+        """손절·본전스탑·방어 강제매도는 시장가. 트레일·익절은 지정가."""
+        if reason.startswith("손절"):
+            return True
+        if reason.startswith("방어모드 매도"):
+            return True
+        if reason.startswith("오버나잇"):
+            return True
+        if reason.startswith("장마감"):
+            return True
+        if reason.startswith("본전스탑") and "트레일링" not in reason:
+            return True
+        return False
 
     def _exit_limit_price(self, holding: HoldingView) -> int | None:
         """청산 시 보수적 지정가(매도) 가격."""
@@ -936,7 +972,7 @@ class AutoTradingStrategy:
                 "■ /auto on · /report"
             )
         ms, me, as_, ae = effective_buy_windows()
-        cut, eod = effective_eod_times()
+        _, eod = effective_eod_times()
         return (
             f"【매매 전략 · {mode_label()}】\n\n"
             f"점검 주기: {effective_auto_interval_sec()}초\n"
@@ -944,25 +980,26 @@ class AutoTradingStrategy:
             f"일반 매수: 최대 {effective_max_buys_per_day()}회/일 · "
             f"트렌드: {strategy_trend_max_buys_per_day}회/일\n\n"
             "■ 매도\n"
-            f"  · 익절: +{strategy_swing_take_profit_pct}% "
-            "(1주=전량, 2주+=50%)\n"
-            f"  · 상위거래량: +{strategy_swing_top_volume_tp1_pct}% 50%, "
-            f"+{strategy_swing_top_volume_tp2_pct}% 총 80%\n"
-            f"  · 부분익절 후 트레일링: 고점 +{strategy_swing_trailing_activate_pct}% "
-            f"→ -{strategy_swing_trailing_drawdown_pct}%p\n"
-            f"  · 본전스탑: 고점 +{strategy_swing_breakeven_activate_pct}% 후 "
-            f"+{strategy_swing_breakeven_floor_pct}% 미만이면 50%(1주는 전량), "
+            "  · 시총 대형(삼성·하이닉스·NAVER 등 10종): "
+            f"손절 -{strategy_stop_loss_pct}% · 당일 강제청산 없음 · "
+            "본전스탑·수익보호 트레일\n"
+            f"  · 그 외: 손절 -{strategy_other_stop_loss_pct}% · "
+            f"고점 -{strategy_other_trail_drawdown_pct}%p 트레일 · "
+            "당일 마감 전량 · 오버나잇 금지\n"
+            f"  · 대형 본전스탑: 고점 +{strategy_swing_breakeven_activate_pct}% 후 "
+            f"+{strategy_swing_breakeven_floor_pct}% 미만·왕복비용 이상이면 "
+            f"50%(1주는 전량), "
             f"잔량은 고점-{strategy_swing_be_remainder_drawdown_pct}%p(바닥 0%) 트레일 · "
             f"{strategy_swing_exit_confirm_cycles}회 확인 · "
             f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
             f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
-            f"  · 수익보호 트레일: 고점 +{strategy_swing_protect_trailing_activate_pct}% "
+            f"  · 대형 수익보호 트레일: 고점 +{strategy_swing_protect_trailing_activate_pct}% "
             f"→ -{strategy_swing_protect_trailing_drawdown_pct}%p · "
             f"{strategy_swing_exit_confirm_cycles}회 확인 · "
             f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
             f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
-            f"  · 손절: -{strategy_stop_loss_pct}% · 청산: "
-            f"{'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
+            f"  · 손절·본전스탑·방어·장마감 시장가, "
+            f"트레일 {'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
             + (
                 "  · 정체 청산: 비활성\n"
                 if int(strategy_swing_stagnation_minutes) <= 0
@@ -971,19 +1008,12 @@ class AutoTradingStrategy:
                     f"+{strategy_swing_stagnation_max_profit_pct:.1f}% 미만\n"
                 )
             )
-            + f"  · 장마감: "
             + (
-                f"{cut} 손실 정리"
-                if strategy_eod_cut_loss_enabled
-                else "손실 강제청산 없음"
-            )
-            + (
-                f" · {eod} 전량"
-                if strategy_swing_eod_sell_all
-                else (
-                    f" · {eod} +{strategy_swing_eod_sell_if_below_pct:.0f}% 미만 청산"
-                    if strategy_swing_eod_sell_if_below_pct > 0
-                    else f" · 수익 종목 익절(+{strategy_swing_take_profit_pct:.0f}%)까지 보유"
+                f"  · 장마감: 대형 강제청산 없음"
+                + (
+                    f" · 그 외 {eod} 전량"
+                    if strategy_other_eod_sell_all
+                    else ""
                 )
             )
             + "\n\n"
@@ -1550,59 +1580,18 @@ class AutoTradingStrategy:
         holding: HoldingView,
         state: PositionState | None,
         news: MarketNewsContext | None = None,
-        *,
-        is_top_volume: bool = False,
     ) -> tuple[str | None, int, int | None]:
         profit = holding.profit_pct
         sellable = holding.sellable_qty
         if sellable <= 0:
             return None, 0, None
 
-        # 수익 실현(부분매도) 규칙
-        # - 일반: +10%에서 50% 매도
-        # - 상위 거래량(거래대금) 종목: +15%에서 50%, +20%에서 총 80%까지 매도
+        mega = is_mega_cap(holding.code)
         entry_qty = getattr(state, "entry_qty", 0) if state else 0
         if entry_qty <= 0:
             entry_qty = holding.qty
         already_sold = max(0, entry_qty - holding.qty)
         stage_done = getattr(state, "tp_stage", 0) if state else 0
-
-        if is_top_volume:
-            if stage_done < 1 and profit >= strategy_swing_top_volume_tp1_pct:
-                qty = self._calc_stage_sell_qty(
-                    entry_qty, sellable, already_sold, 0.50
-                )
-                if qty > 0:
-                    return (
-                        f"수익실현(상위거래량) +{strategy_swing_top_volume_tp1_pct:.0f}% "
-                        f"{'전량' if entry_qty <= 1 else '50%'} 매도",
-                        qty,
-                        1,
-                    )
-            if stage_done < 2 and profit >= strategy_swing_top_volume_tp2_pct:
-                qty = self._calc_stage_sell_qty(
-                    entry_qty, sellable, already_sold, 0.80
-                )
-                if qty > 0:
-                    return (
-                        f"수익실현(상위거래량) +{strategy_swing_top_volume_tp2_pct:.0f}% "
-                        f"{'전량' if entry_qty <= 1 else '총 80%'} 매도",
-                        qty,
-                        2,
-                    )
-        elif stage_done < 1 and profit >= strategy_swing_take_profit_pct:
-            qty = self._calc_stage_sell_qty(entry_qty, sellable, already_sold, 0.50)
-            if qty > 0:
-                label = (
-                    "전량"
-                    if entry_qty <= 1
-                    else f"{int(strategy_partial_sell_ratio * 100)}%"
-                )
-                return (
-                    f"수익실현 +{strategy_swing_take_profit_pct:.0f}% {label} 매도",
-                    qty,
-                    1,
-                )
 
         if is_scalping_mode():
             hold_min = self.positions.holding_minutes(holding.code)
@@ -1619,9 +1608,20 @@ class AutoTradingStrategy:
         qty = sellable
         peak = state.peak_profit_pct if state else profit
 
-        if self._is_eod_sell_all_time():
+        if (
+            not mega
+            and strategy_other_flatten_overnight
+            and self.positions.is_overnight(holding.code)
+        ):
+            return "오버나잇 금지 청산", qty, None
+
+        if not mega and self._is_eod_sell_all_time():
             _, eod = effective_eod_times()
-            if is_scalping_mode() or strategy_swing_eod_sell_all:
+            if (
+                is_scalping_mode()
+                or strategy_swing_eod_sell_all
+                or strategy_other_eod_sell_all
+            ):
                 return f"장마감 전량 청산 ({eod})", qty, None
             below = float(strategy_swing_eod_sell_if_below_pct)
             if below > 0 and profit < below:
@@ -1631,78 +1631,89 @@ class AutoTradingStrategy:
                     None,
                 )
 
-        if self._is_eod_cut_loss_time() and profit < 0:
+        if not mega and self._is_eod_cut_loss_time() and profit < 0:
             cut, _ = effective_eod_times()
             return f"장마감 손실 정리 ({cut})", qty, None
 
-        if profit <= -strategy_stop_loss_pct:
-            return f"손절 ({profit:.2f}% <= -{strategy_stop_loss_pct}%)", qty, None
+        stop_pct = (
+            float(strategy_stop_loss_pct)
+            if mega
+            else float(strategy_other_stop_loss_pct)
+        )
+        if profit <= -stop_pct:
+            return f"손절 ({profit:.2f}% <= -{stop_pct}%)", qty, None
 
-        # 정체 청산(time-stop): 장시간 보유에도 수익 전환 실패 시 정리
-        stagnation_min = max(0, int(strategy_swing_stagnation_minutes))
-        if stagnation_min > 0:
-            hold_min = self.positions.holding_minutes(holding.code)
-            if (
-                hold_min is not None
-                and hold_min >= stagnation_min
-                and profit < float(strategy_swing_stagnation_max_profit_pct)
-            ):
+        if not mega:
+            act = float(strategy_other_trail_activate_pct)
+            dd = float(strategy_other_trail_drawdown_pct)
+            if peak >= act and profit < peak - dd:
                 return (
-                    f"정체 청산 (보유 {hold_min:.0f}분 ≥ {stagnation_min}분, "
-                    f"수익 {profit:.2f}% < "
-                    f"+{strategy_swing_stagnation_max_profit_pct:.1f}%)",
+                    f"중소형 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
                     qty,
                     None,
                 )
-
-        # 부분 익절 후에만 트레일링 (조기 청산 방지)
-        if stage_done >= 1 and peak >= strategy_swing_trailing_activate_pct:
-            trail_floor = peak - strategy_swing_trailing_drawdown_pct
-            if profit < trail_floor:
-                return (
-                    f"트레일링 스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                    qty,
-                    None,
-                )
-
-        # 수익 보호: 1주 포지션 포함 모든 보유에 적용 (부분익절 게이트 없음)
-        be_scaled = bool(getattr(state, "be_scaled", False)) if state else False
-        # 본전스탑 50% 이후 잔량은 더 넓은 폭·본전(0%) 바닥으로 트레일
-        if be_scaled:
-            remainder_dd = float(strategy_swing_be_remainder_drawdown_pct)
-            protect_floor = max(0.0, peak - remainder_dd)
-            if profit < protect_floor:
-                return (
-                    f"본전스탑 잔량 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                    qty,
-                    None,
-                )
-        elif peak >= strategy_swing_protect_trailing_activate_pct:
-            protect_floor = peak - strategy_swing_protect_trailing_drawdown_pct
-            if profit < protect_floor:
-                return (
-                    f"수익보호 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                    qty,
-                    None,
-                )
-        # 2) 본전스탑 — 한 번 +N% 갔다가 본전 부근이면 50% (1주는 전량)
-        if (
-            not be_scaled
-            and peak >= strategy_swing_breakeven_activate_pct
-            and profit < strategy_swing_breakeven_floor_pct
-        ):
-            be_qty = self._calc_stage_sell_qty(
-                entry_qty, sellable, already_sold, 0.50
-            )
-            if be_qty > 0:
-                label = (
-                    f"본전스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
-                    if entry_qty <= 1 or be_qty >= sellable
-                    else (
-                        f"본전스탑 50% 매도 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
+        else:
+            stagnation_min = max(0, int(strategy_swing_stagnation_minutes))
+            if stagnation_min > 0:
+                hold_min = self.positions.holding_minutes(holding.code)
+                if (
+                    hold_min is not None
+                    and hold_min >= stagnation_min
+                    and profit < float(strategy_swing_stagnation_max_profit_pct)
+                ):
+                    return (
+                        f"정체 청산 (보유 {hold_min:.0f}분 ≥ {stagnation_min}분, "
+                        f"수익 {profit:.2f}% < "
+                        f"+{strategy_swing_stagnation_max_profit_pct:.1f}%)",
+                        qty,
+                        None,
                     )
+
+            if stage_done >= 1 and peak >= strategy_swing_trailing_activate_pct:
+                trail_floor = peak - strategy_swing_trailing_drawdown_pct
+                if profit < trail_floor:
+                    return (
+                        f"트레일링 스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
+                        qty,
+                        None,
+                    )
+
+            be_scaled = bool(getattr(state, "be_scaled", False)) if state else False
+            if be_scaled:
+                remainder_dd = float(strategy_swing_be_remainder_drawdown_pct)
+                protect_floor = max(0.0, peak - remainder_dd)
+                if profit < protect_floor:
+                    return (
+                        f"본전스탑 잔량 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
+                        qty,
+                        None,
+                    )
+            elif peak >= strategy_swing_protect_trailing_activate_pct:
+                protect_floor = peak - strategy_swing_protect_trailing_drawdown_pct
+                if profit < protect_floor:
+                    return (
+                        f"수익보호 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
+                        qty,
+                        None,
+                    )
+            if (
+                not be_scaled
+                and peak >= strategy_swing_breakeven_activate_pct
+                and profit < strategy_swing_breakeven_floor_pct
+                and profit >= round_trip_cost_pct()
+            ):
+                be_qty = self._calc_stage_sell_qty(
+                    entry_qty, sellable, already_sold, 0.50
                 )
-                return label, be_qty, None
+                if be_qty > 0:
+                    label = (
+                        f"본전스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
+                        if entry_qty <= 1 or be_qty >= sellable
+                        else (
+                            f"본전스탑 50% 매도 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
+                        )
+                    )
+                    return label, be_qty, None
 
         if news and news.defensive_mode:
             skip_overnight = (
@@ -1804,7 +1815,11 @@ class AutoTradingStrategy:
             return False
 
         try:
-            limit_price = self._exit_limit_price(holding)
+            limit_price = (
+                None
+                if self._exit_uses_market(reason)
+                else self._exit_limit_price(holding)
+            )
 
             if limit_price:
                 order = self.client.sell_limit(
@@ -1979,21 +1994,10 @@ class AutoTradingStrategy:
             self._add_throttled_error(result, "holdings_sell", f"잔고 조회 실패(매도): {exc}")
             return 0
 
-        top_volume_codes: set[str] = set()
-        if holdings:
-            try:
-                rank_items = self.client.get_trade_value_rank(
-                    top_n=max(1, int(top_volume_rank_n))
-                )
-                top_volume_codes = {self.client.normalize_stock_code(i.get("stk_cd", "")) for i in rank_items}
-            except Exception:
-                top_volume_codes = set()
-
         for holding in holdings:
             state = self.positions.get(holding.code)
-            is_top_volume = holding.code in top_volume_codes
             reason, sell_qty, tp_stage = self._evaluate_sell(
-                holding, state, news, is_top_volume=is_top_volume
+                holding, state, news
             )
             vol_class, vol_ratio = self._exit_volume_class(holding.code, reason)
             if reason and vol_class == "heavy" and vol_ratio is not None:
@@ -2669,6 +2673,12 @@ class AutoTradingStrategy:
     ) -> None:
         try:
             order_qty = self._calc_order_qty(candidate.current_price, channel="crash")
+            if order_qty <= 0:
+                result.add_report(
+                    f"수량 0 스킵 - {candidate.name}({candidate.code}) "
+                    f"1주가 목표 {position_target_krw:,}원 초과"
+                )
+                return
             order = self.client.buy_market(
                 candidate.code,
                 order_qty,
@@ -2815,6 +2825,12 @@ class AutoTradingStrategy:
     ) -> None:
         try:
             order_qty = self._calc_order_qty(pick.current_price, channel="trend")
+            if order_qty <= 0:
+                result.add_report(
+                    f"수량 0 스킵 - {pick.name}({pick.code}) "
+                    f"1주가 목표 {position_target_krw:,}원 초과"
+                )
+                return
             order = self.client.buy_market(
                 pick.code,
                 order_qty,
@@ -2880,6 +2896,12 @@ class AutoTradingStrategy:
             order_qty = self._calc_order_qty(
                 candidate.current_price, channel=channel
             )
+            if order_qty <= 0:
+                result.add_report(
+                    f"수량 0 스킵 - {candidate.name}({candidate.code}) "
+                    f"1주가 목표 {position_target_krw:,}원 초과"
+                )
+                return
             order = self.client.buy_market(
                 candidate.code,
                 order_qty,

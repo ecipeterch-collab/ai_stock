@@ -109,3 +109,22 @@ def test_defensive_still_sells_same_day_loser(
     assert reason is not None
     assert "방어모드" in reason
     assert qty == 2
+
+
+def test_defensive_holds_small_same_day_red(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    strat = _strategy(monkeypatch)
+    strat.positions.is_overnight.return_value = False
+    news = MarketNewsContext(
+        sentiment=-0.88,
+        risk_score=0.52,
+        defensive_mode=True,
+    )
+    reason, qty, _stage = strat._evaluate_sell(
+        _holding(code="005380", name="현대차", qty=2, profit=-1.50),
+        _state(qty=2),
+        news,
+    )
+    assert reason is None
+    assert qty == 0

@@ -64,6 +64,11 @@ def get_sell_tax_rate_pct() -> float:
     return max(0.0, _config_float("trade_sell_tax_rate_pct", 0.20))
 
 
+def round_trip_cost_pct() -> float:
+    """매수·매도 수수료 + 매도세 (%). 본전스탑 비용 바닥."""
+    return get_commission_rate_pct() * 2.0 + get_sell_tax_rate_pct()
+
+
 def fee_settings_snapshot() -> dict:
     return {
         "initial_capital_krw": get_initial_capital(),

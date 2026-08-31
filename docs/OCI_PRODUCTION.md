@@ -8,11 +8,12 @@
 
 | 항목 | 값 |
 |------|-----|
-| SSH | `ssh -i $env:USERPROFILE\.ssh\jhunnet-migrate ubuntu@<STOCK_IP>` |
-| 예약 공인 IP | _(콘솔에서 할당 후)_ |
-| Shape | A1 1 OCPU/6GB (우선) 또는 E2.1.Micro |
-| Origin 인증서 | `/etc/ssl/cloudflare/stock.jhunnet.com.pem` |
+| SSH | `ssh -i $env:USERPROFILE\.ssh\jhunnet-migrate ubuntu@168.110.39.205` |
+| 공인 IP | `168.110.39.205` (생성 시 ephemeral. 콘솔에서 Reserved로 고정 권장) |
+| Shape | `VM.Standard.E2.1.Micro` (A1 용량 없음 → 폴백). x86_64, RAM 1GB, Ubuntu 22.04, Python 3.10 venv + systemd |
+| Origin 인증서 | `/etc/ssl/cloudflare/stock.jhunnet.com.pem` → homepage `*.jhunnet.com` 와일드카드 |
 | 앱 경로 | `/home/ubuntu/apps/ai_stock` |
+| 런타임 | systemd `ai-stock-web` · `ai-stock-bot` 둘 다 enable (2026-08-28 컷오버) |
 
 배포:
 

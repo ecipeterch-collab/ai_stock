@@ -18,19 +18,20 @@ def _strategy(monkeypatch: pytest.MonkeyPatch) -> AutoTradingStrategy:
     s.client = MagicMock()
     s.positions = MagicMock()
     s.positions.holding_minutes.return_value = 90.0
+    s.positions.is_overnight.return_value = False
     return s
 
 
-def _holding(*, qty: int, profit: float) -> HoldingView:
+def _holding(*, qty: int, profit: float, code: str = "005930", name: str = "삼성전자") -> HoldingView:
     return HoldingView(
-        code="002990",
-        name="금호건설",
+        code=code,
+        name=name,
         qty=qty,
         sellable_qty=qty,
         profit_pct=profit,
         current_price=15370,
         purchase_price=15390,
-        order_code="002990",
+        order_code=code,
         raw={},
     )
 
@@ -50,7 +51,7 @@ def test_breakeven_stop_sells_half_when_qty_ge_2(
 ) -> None:
     strat = _strategy(monkeypatch)
     reason, qty, stage = strat._evaluate_sell(
-        _holding(qty=64, profit=-0.13),
+        _holding(qty=64, profit=0.40),
         _state(qty=64, peak=4.35),
     )
 
@@ -66,7 +67,7 @@ def test_breakeven_stop_sells_all_when_one_share(
 ) -> None:
     strat = _strategy(monkeypatch)
     reason, qty, stage = strat._evaluate_sell(
-        _holding(qty=1, profit=-0.13),
+        _holding(qty=1, profit=0.40),
         _state(qty=1, peak=4.35),
     )
 
@@ -74,6 +75,19 @@ def test_breakeven_stop_sells_all_when_one_share(
     assert reason.startswith("본전스탑")
     assert qty == 1
     assert stage is None
+
+
+def test_breakeven_stop_skips_when_profit_below_round_trip_cost(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """왕복비용(약 0.23%) 아래면 본전스탑을 걸지 않는다."""
+    strat = _strategy(monkeypatch)
+    reason, qty, _stage = strat._evaluate_sell(
+        _holding(qty=1, profit=0.09),
+        _state(qty=1, peak=4.93),
+    )
+    assert reason is None
+    assert qty == 0
 
 
 def test_breakeven_remainder_trails_after_scale_out(
@@ -210,7 +224,7 @@ def test_stop_loss_skips_exit_confirm(tmp_path) -> None:
     assert strat._confirm_exit_signal("005930", reason) == reason
 
 
-def test_partial_take_profit_fires_at_four_percent(
+def test_mega_does_not_take_profit_at_four_percent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -219,7 +233,6 @@ def test_partial_take_profit_fires_at_four_percent(
         _state(qty=10, peak=4.05),
     )
 
-    assert reason is not None
-    assert "수익실현" in reason
-    assert qty == 5
-    assert stage == 1
+    assert reason is None
+    assert qty == 0
+    assert stage is None

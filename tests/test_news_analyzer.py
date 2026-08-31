@@ -57,11 +57,11 @@ def test_geopolitics_english_rss_excluded_from_sentiment() -> None:
     assert ctx.sentiment > 0
     assert ctx.negative_hits == 0
     assert any("[지정학]" in h for h in ctx.headlines)
-    assert ctx.risk_score > 0
+    assert ctx.risk_score == 0
 
 
 def test_geopolitics_only_headlines_leave_sentiment_neutral() -> None:
-    """지정학 피드만 있으면 심리는 0, 리스크는 남긴다."""
+    """지정학 피드만 있으면 심리·리스크 모두 0."""
     analyzer = MarketNewsAnalyzer()
     items = [
         NewsItem(
@@ -77,6 +77,17 @@ def test_geopolitics_only_headlines_leave_sentiment_neutral() -> None:
     assert ctx.sentiment == 0.0
     assert ctx.negative_hits == 0
     assert ctx.positive_hits == 0
+    assert ctx.risk_score == 0
+
+
+def test_domestic_war_headline_still_raises_risk() -> None:
+    """국내경제 전쟁 헤드라인은 리스크에 남긴다."""
+    analyzer = MarketNewsAnalyzer()
+    items = [
+        NewsItem(category="국내경제", title="중동 전쟁 확전 우려에 유가 급등"),
+        NewsItem(category="지정학", title="War sanctions Iran Hormuz geopolitical crisis"),
+    ]
+    ctx = analyzer.analyze(items)
     assert ctx.risk_score > 0
 
 
