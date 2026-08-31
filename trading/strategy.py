@@ -274,6 +274,16 @@ def clear_error_event_bucket(state: dict[str, dict], bucket: str) -> None:
     state.pop(bucket, None)
 
 
+def _is_token_auth_error(message: str) -> bool:
+    text = message or ""
+    return (
+        "Token이 유효하지 않습니다" in text
+        or "[8005" in text
+        or "8005:" in text
+        or "[8001]" in text
+    )
+
+
 @dataclass
 class AutoRunResult:
     events: list[str] = field(default_factory=list)
@@ -1392,8 +1402,12 @@ class AutoTradingStrategy:
             now=time.monotonic(),
             cooldown_sec=float(api_error_notify_cooldown_sec),
         )
-        if text:
-            result.add_event(text)
+        if not text:
+            return
+        if _is_token_auth_error(message):
+            print(text)
+            return
+        result.add_event(text)
 
     def _collect_new_fills(self, result: AutoRunResult) -> None:
         try:

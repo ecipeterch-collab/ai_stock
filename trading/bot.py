@@ -17,6 +17,7 @@ from config.config import (
     use_paper,
 )
 from kiwoom.client import KiwoomAPIError, KiwoomClient, get_shared_client
+from trading.strategy import AutoTradingStrategy, _is_token_auth_error
 from telegram.tel_send import send_message
 from trading.mode_settings import (
     SETTINGS_FILE,
@@ -32,7 +33,6 @@ from trading.runtime_config import (
     set_strategy_mode,
 )
 from trading.market_utils import is_market_open, market_status_text
-from trading.strategy import AutoTradingStrategy
 
 
 def _get_updates_url() -> str:
@@ -98,7 +98,11 @@ class TelegramTradingBot:
             result = self.strategy.run_cycle()
             self._notify_cycle_events(result)
         except (KiwoomAPIError, requests.RequestException) as exc:
-            self.notify(f"자동매매 통신 오류: {exc}")
+            text = f"자동매매 통신 오류: {exc}"
+            if _is_token_auth_error(text):
+                print(text)
+            else:
+                self.notify(text)
         except Exception as exc:
             self.notify(f"자동매매 점검 오류: {exc}")
 

@@ -48,6 +48,14 @@ def _is_transient_kiwoom_error(body: dict) -> bool:
     return "[4007]" in msg
 
 
+def _is_invalid_token_error(body: dict) -> bool:
+    """다른 프로세스가 토큰을 재발급하면 만료 전에도 8005/8001이 난다."""
+    msg = str(body.get("return_msg") or "")
+    if "Token이 유효하지 않습니다" in msg:
+        return True
+    return "[8005" in msg or "8005:" in msg or "[8001]" in msg
+
+
 _clients: dict[bool, "KiwoomClient"] = {}
 _clients_lock = threading.Lock()
 
@@ -185,6 +193,7 @@ class KiwoomClient:
             last_exc: Exception | None = None
             token: str | None = None
             transient_attempts = 0
+            token_reissued = False
             while True:
                 self._throttle()
                 if token is None:
@@ -232,6 +241,12 @@ class KiwoomClient:
                     ):
                         transient_attempts += 1
                         time.sleep(min(2 ** (transient_attempts - 1), 4))
+                        continue
+                    if _is_invalid_token_error(body) and not token_reissued:
+                        token_reissued = True
+                        self._token = None
+                        self._token_expires_at = None
+                        token = self._issue_token()
                         continue
                     raise KiwoomAPIError(
                         f"{api_id} 오류: {body.get('return_msg')} "

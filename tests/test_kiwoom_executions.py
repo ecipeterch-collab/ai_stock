@@ -112,14 +112,79 @@ def test_post_does_not_retry_non_transient_errors(
     def fake_post(*_a, **_k):
         calls["n"] += 1
         return _json_response(
-            {"return_code": 3, "return_msg": "Token이 유효하지 않습니다. [8001]"}
+            {"return_code": 1, "return_msg": "조회 실패"}
         )
 
     monkeypatch.setattr("kiwoom.client.requests.post", fake_post)
 
-    with pytest.raises(KiwoomAPIError, match="8001"):
+    with pytest.raises(KiwoomAPIError, match="조회 실패"):
         client.post("/api/dostk/acnt", "ka10076", {})
     assert calls["n"] == 1
+
+
+def test_post_reissues_token_on_8005_then_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timedelta
+
+    client = KiwoomClient(paper=True)
+    client._token = "old"
+    client._token_expires_at = datetime.now() + timedelta(hours=12)
+    monkeypatch.setattr(client, "_throttle", lambda: None)
+
+    def fake_issue() -> str:
+        client._token = "new"
+        client._token_expires_at = datetime.now() + timedelta(hours=12)
+        return "new"
+
+    monkeypatch.setattr(client, "_issue_token", fake_issue)
+    auths: list[str] = []
+
+    def fake_post(*_a, **kwargs):
+        auth = kwargs["headers"]["authorization"]
+        auths.append(auth)
+        if auth == "Bearer old":
+            return _json_response(
+                {
+                    "return_code": 3,
+                    "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+                }
+            )
+        return _json_response({"return_code": 0, "return_msg": "ok"})
+
+    monkeypatch.setattr("kiwoom.client.requests.post", fake_post)
+
+    body, _headers = client.post("/api/dostk/acnt", "ka10076", {})
+    assert body["return_code"] == 0
+    assert auths == ["Bearer old", "Bearer new"]
+
+
+def test_post_raises_if_token_still_invalid_after_reissue(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timedelta
+
+    client = KiwoomClient(paper=True)
+    client._token = "old"
+    client._token_expires_at = datetime.now() + timedelta(hours=12)
+    monkeypatch.setattr(client, "_throttle", lambda: None)
+    monkeypatch.setattr(client, "_issue_token", lambda: "new")
+    calls = {"n": 0}
+
+    def fake_post(*_a, **_k):
+        calls["n"] += 1
+        return _json_response(
+            {
+                "return_code": 3,
+                "return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]",
+            }
+        )
+
+    monkeypatch.setattr("kiwoom.client.requests.post", fake_post)
+
+    with pytest.raises(KiwoomAPIError, match="8005"):
+        client.post("/api/dostk/acnt", "ka10076", {})
+    assert calls["n"] == 2
 
 
 def test_post_retries_4007_when_code_is_only_in_message(

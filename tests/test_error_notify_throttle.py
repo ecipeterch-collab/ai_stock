@@ -55,13 +55,13 @@ def _strategy_for_fills() -> AutoTradingStrategy:
     return strat
 
 
-def test_collect_new_fills_notifies_once_for_repeated_token_errors(
+def test_collect_new_fills_notifies_once_for_repeated_query_errors(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr("trading.strategy.api_error_notify_cooldown_sec", 60.0)
     monkeypatch.setattr("trading.strategy.time.monotonic", lambda: 100.0)
     strat = _strategy_for_fills()
-    strat.client.get_executions.side_effect = KiwoomAPIError("토큰 발급 실패: [8001]")
+    strat.client.get_executions.side_effect = KiwoomAPIError("조회 실패: 4007")
 
     first = AutoRunResult()
     strat._collect_new_fills(first)
@@ -70,3 +70,15 @@ def test_collect_new_fills_notifies_once_for_repeated_token_errors(
 
     assert any("체결 조회 실패" in e for e in first.events)
     assert second.events == []
+
+
+def test_collect_new_fills_does_not_telegram_invalid_token_errors() -> None:
+    strat = _strategy_for_fills()
+    strat.client.get_executions.side_effect = KiwoomAPIError(
+        "ka10076 오류: 인증에 실패했습니다[8005:Token이 유효하지 않습니다] "
+        '({"return_msg": "인증에 실패했습니다[8005:Token이 유효하지 않습니다]", '
+        '"return_code": 3})'
+    )
+    result = AutoRunResult()
+    strat._collect_new_fills(result)
+    assert result.events == []
