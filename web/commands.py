@@ -87,7 +87,7 @@ def _get_bot() -> TelegramTradingBot:
     global _bot
     with _bot_lock:
         if _bot is None:
-            _bot = TelegramTradingBot()
+            _bot = TelegramTradingBot(start_auto=False)
         return _bot
 
 

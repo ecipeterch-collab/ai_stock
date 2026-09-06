@@ -56,14 +56,18 @@ POLL_TIMEOUT = 30
 class TelegramTradingBot:
     """텔레그램 명령으로 키움 API 매매를 제어하는 봇."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, start_auto: bool = True) -> None:
         self.client = get_shared_client()
         self.strategy = AutoTradingStrategy(self.client)
         self._auto_thread: threading.Thread | None = None
         self._stop_auto = threading.Event()
+        self._owns_auto_loop = start_auto
         if not SETTINGS_FILE.exists():
             set_strategy_mode(config_strategy_mode)
-        self.restore_auto_trading_from_settings()
+        if start_auto:
+            self.restore_auto_trading_from_settings()
+        elif get_auto_trading_enabled():
+            self.strategy.enable()
 
     def restore_auto_trading_from_settings(self) -> bool:
         """runtime_settings 의 auto_trading_enabled=True 이면 재기동 후에도 루프 복원."""
@@ -435,21 +439,27 @@ class TelegramTradingBot:
         if action in ("on", "start", "1"):
             self.strategy.enable()
             set_auto_trading_enabled(True)
-            self._start_auto_loop()
-            threading.Thread(
-                target=self._run_auto_cycle_silent_check,
-                daemon=True,
-            ).start()
+            if getattr(self, "_owns_auto_loop", True):
+                self._start_auto_loop()
+                threading.Thread(
+                    target=self._run_auto_cycle_silent_check,
+                    daemon=True,
+                ).start()
+                return (
+                    f"자동매매 시작 ({effective_auto_interval_sec()}초 · "
+                    f"{mode_label()})\n"
+                    "알림: 체결·매수·매도·실패 시에만 전송\n"
+                    "계좌·보유: /portfolio"
+                )
             return (
-                f"자동매매 시작 ({effective_auto_interval_sec()}초 · "
-                f"{mode_label()})\n"
-                "알림: 체결·매수·매도·실패 시에만 전송\n"
-                "계좌·보유: /portfolio"
+                "자동매매 설정 ON\n"
+                "매매 루프는 봇 프로세스(ai-stock-bot)가 수행합니다."
             )
         if action in ("off", "stop", "0"):
             self.strategy.disable()
             set_auto_trading_enabled(False)
-            self._stop_auto_loop()
+            if getattr(self, "_owns_auto_loop", True):
+                self._stop_auto_loop()
             return "자동매매 중지"
         return "사용법: /auto on 또는 /auto off"
 
@@ -462,6 +472,11 @@ class TelegramTradingBot:
             while not self._stop_auto.is_set():
                 if self._stop_auto.wait(effective_auto_interval_sec()):
                     break
+                saved = get_auto_trading_enabled()
+                if saved is False:
+                    self.strategy.disable()
+                elif saved is True:
+                    self.strategy.enable()
                 if self.strategy.enabled:
                     self._run_auto_cycle_silent_check()
 

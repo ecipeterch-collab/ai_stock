@@ -1034,8 +1034,10 @@ class AutoTradingStrategy:
                 f"(오전 모멘텀·이후 눌림)\n"
                 f"  · 등락 +{strategy_chart_primary_max_flu_rt:.0f}% 초과 금지 · "
                 "고변동 오후 신규 차트매수 없음\n"
-                "  · 전략점수·뉴스는 참고/알림\n"
-                "  · ETF/ETN 제외 · 보유 중 제외\n"
+                f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
+                "방어모드면 신규 금지\n"
+                "  · 전략점수·뉴스는 참고/알림 (방어·심리 중단선은 하드스톱)\n"
+                "  · ETF/ETN 제외 · 보유·미체결 제외\n"
                 if chart_primary_mode
                 else (
                     "■ 매수 (모멘텀·ORB 우선)\n"
@@ -1387,6 +1389,18 @@ class AutoTradingStrategy:
     def _position_sync_grace_minutes(self) -> int:
         return max(0, int(strategy_position_sync_grace_minutes))
 
+    def _is_recent_open_lot(self, code: str, now: datetime | None = None) -> bool:
+        """매수 직후 키움 잔고 반영 전. 이 동안 tracker 종목은 지우지 않는다."""
+        state = self.positions.get(code)
+        if state is None or not state.entry_time:
+            return False
+        try:
+            entered = datetime.fromisoformat(state.entry_time)
+        except ValueError:
+            return False
+        minutes = ((now or datetime.now()) - entered).total_seconds() / 60.0
+        return 0 <= minutes < float(self._position_sync_grace_minutes())
+
     def _should_suppress_holding_sync(self, code: str) -> bool:
         """청산 직후 API 잔고 지연으로 포지션이 재생성되는 것을 방지."""
         since = self.positions.cooldown_minutes_since_exit(code)
@@ -1479,6 +1493,8 @@ class AutoTradingStrategy:
         held_codes = {h.code for h in holdings}
         for code in list(tracked):
             if code not in held_codes:
+                if self._is_recent_open_lot(code):
+                    continue
                 self.positions.remove(code)
             elif self._should_suppress_holding_sync(code):
                 self.positions.remove(code)
@@ -1626,6 +1642,7 @@ class AutoTradingStrategy:
             not mega
             and strategy_other_flatten_overnight
             and self.positions.is_overnight(holding.code)
+            and not (0 < profit < round_trip_cost_pct())
         ):
             return "오버나잇 금지 청산", qty, None
 
@@ -1635,7 +1652,7 @@ class AutoTradingStrategy:
                 is_scalping_mode()
                 or strategy_swing_eod_sell_all
                 or strategy_other_eod_sell_all
-            ):
+            ) and not (0 < profit < round_trip_cost_pct()):
                 return f"장마감 전량 청산 ({eod})", qty, None
             below = float(strategy_swing_eod_sell_if_below_pct)
             if below > 0 and profit < below:
@@ -2209,6 +2226,26 @@ class AutoTradingStrategy:
                 f"【추가매수 실패】 {holding.name}\n네트워크: {exc}"
             )
 
+    def _blocked_buy_codes(self, holdings: list[HoldingView]) -> set[str]:
+        """키움 잔고 + 방금 등록한 미체결 로트. 디스크에서 다시 읽어 다른 프로세스 주문을 본다."""
+        try:
+            self.positions.load()
+        except Exception:
+            pass
+        codes = {h.code for h in holdings}
+        codes.update(self.positions.codes())
+        return codes
+
+    def _news_blocks_new_buys(self, news: MarketNewsContext | None) -> str | None:
+        if news is None:
+            return None
+        if news.defensive_mode:
+            return (
+                f"방어모드 - 신규매수 중단 "
+                f"(심리 {news.sentiment:+.2f})"
+            )
+        return None
+
     def _run_buy_phase(
         self,
         result: AutoRunResult,
@@ -2217,10 +2254,15 @@ class AutoTradingStrategy:
         *,
         candidates: list[CandidateView] | None = None,
     ) -> None:
-        held_codes = {h.code for h in holdings}
+        held_codes = self._blocked_buy_codes(holdings)
         snap = self._cycle_ctx.regime if self._cycle_ctx else None
         channel_pullback = is_channel_allowed(snap, "pullback")
         channel_momentum = is_channel_allowed(snap, "momentum")
+
+        blocked = self._news_blocks_new_buys(news)
+        if blocked:
+            result.add_report(self._heartbeat(blocked))
+            return
 
         # 뉴스 1순위 하드게이트는 레거시 모드에서만. 차순위는 점수 단계에서 반영.
         if (
@@ -2516,6 +2558,28 @@ class AutoTradingStrategy:
             result.add_report(self._heartbeat(f"차트우선 - {detail}"))
             return
 
+        cooldown_min = (
+            scalping_reentry_cooldown_minutes
+            if is_scalping_mode()
+            else strategy_reentry_cooldown_minutes
+        )
+        if cooldown_min > 0:
+            cooled: list[str] = []
+            kept: list[CandidateView] = []
+            for cand in universe:
+                since = self.positions.cooldown_minutes_since_exit(cand.code)
+                if since is not None and since < cooldown_min:
+                    cooled.append(
+                        f"{cand.name}({cand.code}) {since:.0f}분 < {cooldown_min}분"
+                    )
+                    continue
+                kept.append(cand)
+            if not kept:
+                note = cooled[0] if cooled else "쿨다운"
+                result.add_report(self._heartbeat(f"재진입 쿨다운 - {note}"))
+                return
+            universe = kept
+
         market_note = advisory_market_note(candidates)
         regime_note = ""
         if snap is not None:
@@ -2599,6 +2663,8 @@ class AutoTradingStrategy:
             return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
+        if self._news_blocks_new_buys(news):
+            return
         if news and not news.allow_buy and not news_filter_secondary and not chart_primary_mode:
             return
         if news and news.risk_score >= strategy_crash_max_news_risk:
@@ -2616,7 +2682,7 @@ class AutoTradingStrategy:
         if heat:
             return
 
-        held_codes = {h.code for h in holdings}
+        held_codes = self._blocked_buy_codes(holdings)
         if candidates is None:
             try:
                 rank_items = self.client.get_trade_value_rank(
@@ -2768,6 +2834,8 @@ class AutoTradingStrategy:
             return
         if self._daily_loss_blocks_buy() or self._loss_circuit_blocks_buy():
             return
+        if self._news_blocks_new_buys(news):
+            return
         if news and not news.allow_buy and not news_filter_secondary and not chart_primary_mode:
             return
         if not self._can_trend_buy_today():
@@ -2782,7 +2850,7 @@ class AutoTradingStrategy:
         if not is_market_open():
             return
 
-        held = {h.code for h in holdings}
+        held = self._blocked_buy_codes(holdings)
         scan = self.trends.scan()
         if not scan.active_trends or not scan.picks:
             return

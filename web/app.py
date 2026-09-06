@@ -53,7 +53,7 @@ def install_access_log_filters() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 봇·자동매매 루프 초기화 (runtime_settings.auto_trading_enabled 복원)
+    # 대시보드·명령용 봇. 자동매매 루프는 ai-stock-bot 만 기동한다.
     from web.commands import _get_bot
 
     _get_bot()

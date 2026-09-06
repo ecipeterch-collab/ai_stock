@@ -81,4 +81,4 @@ def test_live_config_matches_chart_primary_bull_pullback_policy() -> None:
     assert cfg.strategy_swing_take_profit_pct == 4.0
     assert cfg.auto_interval_sec == 90
     assert cfg.chart_cache_minute_ttl_sec == 90
-    assert cfg.strategy_chart_primary_max_flu_rt == 8.0
+    assert cfg.strategy_chart_primary_max_flu_rt == 4.0

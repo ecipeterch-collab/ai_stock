@@ -67,6 +67,12 @@ def news_score_gate(
     note_parts: list[str] = []
 
     if chart_primary_mode:
+        if news.defensive_mode:
+            return (
+                True,
+                adjusted,
+                f"방어모드 신규매수 중단 (심리 {news.sentiment:+.2f})",
+            )
         if news.sentiment <= news_block_buy_sentiment:
             return (
                 True,

@@ -67,7 +67,7 @@ def test_universe_rejects_chase_flu_above_cap() -> None:
 
 
 def test_universe_keeps_flu_at_cap() -> None:
-    cands = [_cand("005930", "삼성전자", flu=8.0)]
+    cands = [_cand("005930", "삼성전자", flu=4.0)]
     kept, _rejected = filter_chart_primary_universe(cands, set())
     assert [c.code for c in kept] == ["005930"]
 
@@ -188,6 +188,8 @@ def test_chart_primary_buy_skips_when_news_sentiment_blocked() -> None:
     strat._heartbeat = lambda action, target="": action
     strat._in_morning_buy_window = lambda: True
     strat._execute_buy = MagicMock()
+    strat.positions = MagicMock()
+    strat.positions.cooldown_minutes_since_exit.return_value = None
     strat._pick_chart_primary = MagicMock(
         return_value=(
             cand,

@@ -49,7 +49,7 @@ chart_eval_max_candidates = 5
 # 차트 우선: False면 모멘텀·점수 채널이 본결정
 chart_primary_mode = True
 chart_primary_eval_max_candidates = 10
-strategy_chart_primary_max_flu_rt = 8.0  # 당일 등락 이 % 초과 차트우선 매수 금지
+strategy_chart_primary_max_flu_rt = 4.0  # 당일 등락 이 % 초과 차트우선 매수 금지
 
 # Opening Range Breakout (시초 15분 고가 돌파)
 orb_enabled = True

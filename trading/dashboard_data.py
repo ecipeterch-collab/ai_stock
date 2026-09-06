@@ -9,7 +9,7 @@ from kiwoom.client import KiwoomAPIError, get_shared_client
 from trading.market_utils import market_status_text
 from trading.account_pnl import build_account_summary
 from trading.journal_stats import build_daily_summary, build_journal_stats
-from trading.mode_settings import get_strategy_mode, mode_label
+from trading.mode_settings import get_auto_trading_enabled, get_strategy_mode, mode_label
 from trading.runtime_config import effective_max_buys_per_day, effective_max_positions
 from trading.strategy import AutoTradingStrategy
 
@@ -81,8 +81,9 @@ def build_dashboard_snapshot(strategy: AutoTradingStrategy | None = None) -> dic
     client = strat.client
     strat._reset_daily_counter()
 
-    # 저장 설정과 달리 strategy.enabled·루프는 프로세스 재시작 시 초기화됨 → 실제 상태 우선
-    auto_on = strat.enabled
+    # 저장 설정과 달리 strategy.enabled·루프는 프로세스 재시작 시 초기화됨 → 파일 설정 우선
+    saved_auto = get_auto_trading_enabled()
+    auto_on = strat.enabled if saved_auto is None else bool(saved_auto)
 
     snapshot: dict = {
         "updated_at": datetime.now().isoformat(timespec="seconds"),

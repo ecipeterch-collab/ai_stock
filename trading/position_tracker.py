@@ -114,6 +114,9 @@ class PositionTracker:
     def get(self, code: str) -> PositionState | None:
         return self._positions.get(self._norm(code))
 
+    def open_codes(self) -> set[str]:
+        return set(self._positions.keys())
+
     def register(
         self,
         code: str,
