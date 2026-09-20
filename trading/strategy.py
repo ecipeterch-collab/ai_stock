@@ -155,6 +155,18 @@ try:
     from config.config import strategy_other_flatten_overnight as strategy_other_flatten_overnight
 except ImportError:
     strategy_other_flatten_overnight = True
+try:
+    from config.config import advise_sells_enabled as advise_sells_enabled
+except ImportError:
+    advise_sells_enabled = True
+try:
+    from config.config import strategy_disaster_stop_pct as strategy_disaster_stop_pct
+except ImportError:
+    strategy_disaster_stop_pct = 5.0
+try:
+    from config.config import advise_sell_ignore_cooldown_min as advise_sell_ignore_cooldown_min
+except ImportError:
+    advise_sell_ignore_cooldown_min = 20
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from trading.market_utils import (
     calc_profit_pct,
@@ -166,6 +178,12 @@ from trading.market_utils import (
 from trading.journal_stats import build_daily_summary, format_daily_summary_text
 from trading.account_pnl import build_account_summary, format_account_summary_text
 from trading.account_settings import round_trip_cost_pct
+from trading.trade_proposals import (
+    TradeProposalStore,
+    format_buy_watchlist,
+    format_sell_proposal_text,
+    sell_proposal_markup,
+)
 from trading.mega_cap import is_mega_cap
 from trading.position_tracker import PositionState, PositionTracker
 from trading.news_analyzer import MarketNewsAnalyzer, MarketNewsContext
@@ -240,6 +258,8 @@ EVENT_PREFIXES = (
     "【매도 불가",
     "【주문 접수",
     "【주문 실패",
+    "【매도 제안",
+    "【매수 후보",
 )
 
 
@@ -288,6 +308,7 @@ def _is_token_auth_error(message: str) -> bool:
 class AutoRunResult:
     events: list[str] = field(default_factory=list)
     report: list[str] = field(default_factory=list)
+    button_events: list[tuple[str, dict]] = field(default_factory=list)
 
     def add_event(self, message: str) -> None:
         if message:
@@ -296,6 +317,12 @@ class AutoRunResult:
     def add_report(self, message: str) -> None:
         if message:
             self.report.append(message)
+
+    def add_button_event(self, message: str, reply_markup: dict) -> None:
+        if not message:
+            return
+        self.events.append(message)
+        self.button_events.append((message, reply_markup))
 
     @property
     def messages(self) -> list[str]:
@@ -337,6 +364,7 @@ class AutoTradingStrategy:
         self._circuit_reset_date: date | None = None
         self._breaker_alert_date: date | None = None
         self.positions = PositionTracker()
+        self.proposals = TradeProposalStore()
         self.news = MarketNewsAnalyzer()
         self.trends = TrendScanner(client)
         self.journal = TradeJournal()
@@ -996,6 +1024,8 @@ class AutoTradingStrategy:
             f"  · 그 외: 손절 -{strategy_other_stop_loss_pct}% · "
             f"고점 -{strategy_other_trail_drawdown_pct}%p 트레일 · "
             "당일 마감 전량 · 오버나잇 금지\n"
+            f"  · 재해 손절 −{float(strategy_disaster_stop_pct):.0f}%만 자동 매도. "
+            "그 외 매도는 텔레그램 [매도]/[보류]/[무시]\n"
             f"  · 대형 본전스탑: 고점 +{strategy_swing_breakeven_activate_pct}% 후 "
             f"+{strategy_swing_breakeven_floor_pct}% 미만·왕복비용 이상이면 "
             f"50%(1주는 전량), "
@@ -1260,6 +1290,8 @@ class AutoTradingStrategy:
         if self._crash_buy_count_date != today:
             self._crash_buy_count_date = today
             self._crash_buy_count = 0
+        if getattr(self, "proposals", None) is not None:
+            self.proposals.reset_day(today)
 
     def _can_addon_buy_today(self, code: str) -> bool:
         self._reset_daily_counter()
@@ -2060,6 +2092,9 @@ class AutoTradingStrategy:
             if sell_qty > 0:
                 is_partial = sell_qty < holding.sellable_qty
                 mark_be = is_partial and reason.startswith("본전스탑")
+                if not self._should_auto_execute_sell(holding):
+                    self._propose_sell(holding, reason, sell_qty, result)
+                    continue
                 if self._execute_sell(
                     holding,
                     reason,
@@ -2072,7 +2107,93 @@ class AutoTradingStrategy:
                     sold_count += 1
                     self._invalidate_holdings_cache()
                     self.positions.clear_exit_signal(holding.code)
+                    pending = self.proposals.get(holding.code)
+                    if pending and pending.status == "pending":
+                        self.proposals.mark_done(pending.id)
         return sold_count
+
+    def _should_auto_execute_sell(self, holding: HoldingView) -> bool:
+        if is_scalping_mode() or not advise_sells_enabled:
+            return True
+        return holding.profit_pct <= -float(strategy_disaster_stop_pct)
+
+    def _propose_sell(
+        self,
+        holding: HoldingView,
+        reason: str,
+        sell_qty: int,
+        result: AutoRunResult,
+    ) -> None:
+        prop, notify = self.proposals.upsert_pending(
+            code=holding.code,
+            name=holding.name,
+            qty=sell_qty,
+            reason=reason,
+            profit_pct=holding.profit_pct,
+            price=holding.current_price,
+            ignore_cooldown_min=int(advise_sell_ignore_cooldown_min),
+        )
+        if not notify:
+            return
+        text = format_sell_proposal_text(
+            name=holding.name,
+            code=holding.code,
+            profit_pct=holding.profit_pct,
+            price=holding.current_price,
+            qty=sell_qty,
+            reason=reason,
+        )
+        result.add_button_event(text, sell_proposal_markup(prop.id))
+
+    def execute_approved_sell(self, proposal_id: str) -> str:
+        prop = self.proposals.get_by_id(proposal_id)
+        if prop is None or prop.status != "pending":
+            return "【매도 제안】 만료되었거나 이미 처리된 제안입니다."
+        try:
+            holdings = self._parse_holdings(force_refresh=True)
+        except (KiwoomAPIError, requests.RequestException) as exc:
+            return f"잔고 조회 실패: {exc}"
+        holding = next((h for h in holdings if h.code == prop.code), None)
+        if holding is None or holding.sellable_qty <= 0:
+            return (
+                f"【매도 불가】 {prop.name}({prop.code})\n"
+                "매매가능수량 0주입니다. (결제 대기·미체결 확인)"
+            )
+        qty = min(int(prop.qty), holding.sellable_qty)
+        result = AutoRunResult()
+        ok = self._execute_sell(
+            holding,
+            f"사용자 승인 · {prop.reason}",
+            qty,
+            result,
+        )
+        if ok:
+            self.proposals.mark_done(prop.id)
+            self._invalidate_holdings_cache()
+            self.positions.clear_exit_signal(holding.code)
+        texts = [m for m in (result.events + result.report) if m]
+        if texts:
+            return "\n\n".join(texts)
+        return "매도 주문을 넣었습니다." if ok else "매도 실패"
+
+    def hold_sell_proposal(self, proposal_id: str) -> str:
+        prop = self.proposals.mark_held(proposal_id)
+        if prop is None:
+            return "【매도 제안】 만료되었거나 이미 처리된 제안입니다."
+        return (
+            f"【매도 보류】 {prop.name}({prop.code}) "
+            "오늘 같은 사유는 다시 제안하지 않습니다."
+        )
+
+    def ignore_sell_proposal(self, proposal_id: str) -> str:
+        prop = self.proposals.mark_ignored(proposal_id)
+        if prop is None:
+            return "【매도 제안】 만료되었거나 이미 처리된 제안입니다."
+        mins = int(advise_sell_ignore_cooldown_min)
+        return (
+            f"【매도 무시】 {prop.name}({prop.code}) "
+            f"{mins}분 후 다시 제안할 수 있습니다."
+        )
 
     def _portfolio_heat_blocks_buy(self, holdings: list[HoldingView]) -> str | None:
         heat_limit, heat_pct = effective_portfolio_heat()
@@ -2246,6 +2367,48 @@ class AutoTradingStrategy:
             )
         return None
 
+    def _mark_buy_skip(self, reason: str) -> None:
+        self._buy_skip_reason = reason
+
+    def _note_buy_watchlist(
+        self,
+        cands: list[CandidateView],
+        scores: dict[str, float] | None = None,
+    ) -> None:
+        rows: list[tuple[str, str, float]] = []
+        for cand in cands[:3]:
+            if scores and cand.code in scores:
+                score = float(scores[cand.code])
+            else:
+                score = float(advisory_strategy_score(cand, momentum=False))
+            rows.append((cand.name, cand.code, score))
+        self._buy_watchlist = rows
+
+    def _flush_buy_watchlist(self, result: AutoRunResult, events_before: int) -> None:
+        bought_code: str | None = None
+        bought_idx: int | None = None
+        prefixes = ("【자동매수】", "【급락 매수】", "【트렌드 매수】", "【스캘핑 매수】")
+        for i, event in enumerate(result.events[events_before:], start=events_before):
+            if not event.startswith(prefixes):
+                continue
+            bought_idx = i
+            for line in event.splitlines():
+                if "종목:" in line and "(" in line:
+                    bought_code = line.rsplit("(", 1)[-1].rstrip(")")
+                    break
+            break
+        rows = getattr(self, "_buy_watchlist", []) or []
+        if bought_idx is not None:
+            extra = format_buy_watchlist(rows, bought_code=bought_code)
+            result.events[bought_idx] = result.events[bought_idx].rstrip() + "\n" + extra
+            return
+        result.add_event(
+            format_buy_watchlist(
+                rows,
+                skip_reason=getattr(self, "_buy_skip_reason", None) or "후보 없음",
+            )
+        )
+
     def _run_buy_phase(
         self,
         result: AutoRunResult,
@@ -2254,6 +2417,8 @@ class AutoTradingStrategy:
         *,
         candidates: list[CandidateView] | None = None,
     ) -> None:
+        self._buy_watchlist = []
+        self._buy_skip_reason = "후보 없음"
         held_codes = self._blocked_buy_codes(holdings)
         snap = self._cycle_ctx.regime if self._cycle_ctx else None
         channel_pullback = is_channel_allowed(snap, "pullback")
@@ -2261,6 +2426,7 @@ class AutoTradingStrategy:
 
         blocked = self._news_blocks_new_buys(news)
         if blocked:
+            self._mark_buy_skip(blocked)
             result.add_report(self._heartbeat(blocked))
             return
 
@@ -2270,37 +2436,39 @@ class AutoTradingStrategy:
             and not news.allow_buy
             and not news_filter_secondary
         ):
-            result.add_report(
-                self._heartbeat(
-                    "뉴스 필터 - 신규매수 중단 "
-                    f"(심리 {news.sentiment:+.2f}, 리스크 {news.risk_score:.2f})"
-                )
+            reason = (
+                "뉴스 필터 - 신규매수 중단 "
+                f"(심리 {news.sentiment:+.2f}, 리스크 {news.risk_score:.2f})"
             )
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         daily = self._daily_loss_blocks_buy()
         if daily:
             self._alert_buy_block(result, daily)
+            self._mark_buy_skip(daily)
             result.add_report(self._heartbeat(daily))
             return
 
         breaker = self._loss_circuit_blocks_buy()
         if breaker:
             self._alert_buy_block(result, breaker)
+            self._mark_buy_skip(breaker)
             result.add_report(self._heartbeat(breaker))
             return
 
         if not self._can_buy_today():
-            result.add_report(
-                self._heartbeat(f"일일 매수 한도 ({effective_max_buys_per_day()}회)")
-            )
+            reason = f"일일 매수 한도 ({effective_max_buys_per_day()}회)"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         ms, me, as_, ae = effective_buy_windows()
         if not is_buy_window(ms, me, as_, ae):
-            result.add_report(
-                self._heartbeat(f"매수시간 외 ({ms}~{me}, {as_}~{ae})")
-            )
+            reason = f"매수시간 외 ({ms}~{me}, {as_}~{ae})"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         scan_top = scalping_scan_rank_top if is_scalping_mode() else strategy_scan_rank_top
@@ -2310,7 +2478,9 @@ class AutoTradingStrategy:
                 rank_items = self.client.get_trade_value_rank(top_n=scan_top)
                 candidates = self._parse_candidates(rank_items)
             except (KiwoomAPIError, requests.RequestException) as exc:
-                result.add_report(self._heartbeat(f"순위 조회 실패 - {exc}"))
+                reason = f"순위 조회 실패 - {exc}"
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
 
         if position_addon_enabled and not is_scalping_mode():
@@ -2318,13 +2488,14 @@ class AutoTradingStrategy:
 
         max_pos = effective_max_positions()
         if len(holdings) >= max_pos:
-            result.add_report(
-                self._heartbeat(f"보유 한도 ({len(holdings)}/{max_pos})")
-            )
+            reason = f"보유 한도 ({len(holdings)}/{max_pos})"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         heat = self._portfolio_heat_blocks_buy(holdings)
         if heat:
+            self._mark_buy_skip(heat)
             result.add_report(self._heartbeat(heat))
             return
 
@@ -2356,11 +2527,9 @@ class AutoTradingStrategy:
             )
             allow_momentum = momentum_window and channel_momentum
             if not channel_pullback and not allow_momentum:
-                result.add_report(
-                    self._heartbeat(
-                        f"국면 {snap.label if snap else '—'} - 일반매수 채널 OFF"
-                    )
-                )
+                reason = f"국면 {snap.label if snap else '—'} - 일반매수 채널 OFF"
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
 
         min_score = scalping_min_score if is_scalping_mode() else strategy_min_score
@@ -2377,16 +2546,18 @@ class AutoTradingStrategy:
                 and news.sentiment <= strategy_weak_market_sentiment
                 and bull_n < strategy_weak_market_min_bullish_count
             ):
-                result.add_report(
-                    self._heartbeat(
-                        f"부정 뉴스·약세 - 매수 보류 ({bull_detail}, "
-                        f"심리 {news.sentiment:+.2f})"
-                    )
+                reason = (
+                    f"부정 뉴스·약세 - 매수 보류 ({bull_detail}, "
+                    f"심리 {news.sentiment:+.2f})"
                 )
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
 
         if not bullish:
-            result.add_report(self._heartbeat(f"매수 보류 - {market_msg}"))
+            reason = f"매수 보류 - {market_msg}"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         self.chart.prune_stale_cache()
@@ -2412,6 +2583,7 @@ class AutoTradingStrategy:
                 ]
         if not eligible:
             detail = rejected[0] if rejected else "조건 충족 없음"
+            self._mark_buy_skip(f"매수 보류 - {detail}")
             result.add_report(self._heartbeat(f"매수 보류 - {detail}"))
             return
 
@@ -2434,7 +2606,9 @@ class AutoTradingStrategy:
                 filtered.append((cand, score))
             if not filtered:
                 note = cooled[0] if cooled else "쿨다운"
-                result.add_report(self._heartbeat(f"재진입 쿨다운 - {note}"))
+                reason = f"재진입 쿨다운 - {note}"
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
             eligible = filtered
 
@@ -2451,15 +2625,22 @@ class AutoTradingStrategy:
                 filtered.append((cand, score))
             if not filtered:
                 note = blocked_notes[0] if blocked_notes else "손실 쿨다운"
-                result.add_report(self._heartbeat(f"손실 재진입 차단 - {note}"))
+                reason = f"손실 재진입 차단 - {note}"
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
             eligible = filtered
 
         orb_filtered = self._apply_orb_morning_filter(eligible, result)
         if orb_filtered is None:
+            self._mark_buy_skip("ORB 시초구간 형성 중")
             return
         eligible = orb_filtered
 
+        self._note_buy_watchlist(
+            [cand for cand, _ in eligible],
+            {cand.code: float(score) for cand, score in eligible},
+        )
         allow_momentum = (
             not is_scalping_mode()
             and strategy_momentum_buy_enabled
@@ -2472,12 +2653,13 @@ class AutoTradingStrategy:
             channel_pullback=channel_pullback,
         )
         if picked is None:
-            if chart_filter_enabled:
-                result.add_report(
-                    self._heartbeat("차트 필터 - 조건 충족 종목 없음")
-                )
-            else:
-                result.add_report(self._heartbeat("매수 보류 - 조건 충족 없음"))
+            reason = (
+                "차트 필터 - 조건 충족 종목 없음"
+                if chart_filter_enabled
+                else "매수 보류 - 조건 충족 없음"
+            )
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         best, adjusted, chart_result = picked
@@ -2487,7 +2669,9 @@ class AutoTradingStrategy:
             min_score=min_score,
         )
         if hard_stop:
-            result.add_report(self._heartbeat(news_gate_note or "뉴스 극단 부정 중단"))
+            reason = news_gate_note or "뉴스 극단 부정 중단"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
         # 부정 뉴스일 때는 점수 완화 없음 (저품질·레버리지 종목 유입 방지)
         if news and news.sentiment <= strategy_weak_market_sentiment:
@@ -2500,6 +2684,7 @@ class AutoTradingStrategy:
             )
             if news_gate_note:
                 detail = f"{detail} ({news_gate_note})"
+            self._mark_buy_skip(detail)
             result.add_report(self._heartbeat(detail))
             return
 
@@ -2542,9 +2727,9 @@ class AutoTradingStrategy:
             in_morning=self._in_morning_buy_window(),
         )
         if not allow_momentum and not allow_pullback:
-            result.add_report(
-                self._heartbeat("차트우선 - 국면/시간상 채널 없음")
-            )
+            reason = "차트우선 - 국면/시간상 채널 없음"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         universe, rejected = filter_chart_primary_universe(
@@ -2555,6 +2740,7 @@ class AutoTradingStrategy:
         )
         if not universe:
             detail = rejected[0] if rejected else "후보 없음"
+            self._mark_buy_skip(f"차트우선 - {detail}")
             result.add_report(self._heartbeat(f"차트우선 - {detail}"))
             return
 
@@ -2576,10 +2762,13 @@ class AutoTradingStrategy:
                 kept.append(cand)
             if not kept:
                 note = cooled[0] if cooled else "쿨다운"
-                result.add_report(self._heartbeat(f"재진입 쿨다운 - {note}"))
+                reason = f"재진입 쿨다운 - {note}"
+                self._mark_buy_skip(reason)
+                result.add_report(self._heartbeat(reason))
                 return
             universe = kept
 
+        self._note_buy_watchlist(universe)
         market_note = advisory_market_note(candidates)
         regime_note = ""
         if snap is not None:
@@ -2602,11 +2791,12 @@ class AutoTradingStrategy:
             allow_pullback=allow_pullback,
         )
         if picked is None:
-            result.add_report(
-                self._heartbeat(
-                    f"차트 미통과 - 평가 {min(len(universe), int(chart_primary_eval_max_candidates))}종목"
-                )
+            reason = (
+                "차트 미통과 - "
+                f"평가 {min(len(universe), int(chart_primary_eval_max_candidates))}종목"
             )
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
 
         best, adjusted, chart_result, used_momentum = picked
@@ -2616,9 +2806,9 @@ class AutoTradingStrategy:
             min_score=0.0,
         )
         if hard_stop:
-            result.add_report(
-                self._heartbeat(news_gate_note or "차트우선 - 뉴스 심리 중단")
-            )
+            reason = news_gate_note or "차트우선 - 뉴스 심리 중단"
+            self._mark_buy_skip(reason)
+            result.add_report(self._heartbeat(reason))
             return
         strat_score = advisory_strategy_score(best, momentum=used_momentum)
         advisory = build_buy_advisory_notes(
@@ -2979,10 +3169,12 @@ class AutoTradingStrategy:
                 candidate.current_price, channel=channel
             )
             if order_qty <= 0:
-                result.add_report(
+                reason = (
                     f"수량 0 스킵 - {candidate.name}({candidate.code}) "
                     f"1주가 목표 {position_target_krw:,}원 초과"
                 )
+                self._mark_buy_skip(reason)
+                result.add_report(reason)
                 return
             order = self.client.buy_market(
                 candidate.code,
@@ -3212,6 +3404,7 @@ class AutoTradingStrategy:
                             self._heartbeat(f"스케일 - {cycle_ctx.drawdown.message}")
                         )
                     shared = cycle_ctx.candidates
+                    events_before_buy = len(result.events)
                     self._run_buy_phase(
                         result, holdings, news_ctx, candidates=shared
                     )
@@ -3219,6 +3412,8 @@ class AutoTradingStrategy:
                         result, holdings, news_ctx, candidates=shared
                     )
                     self._run_trend_buy_phase(result, holdings, news_ctx)
+                    if not is_scalping_mode():
+                        self._flush_buy_watchlist(result, events_before_buy)
                 except (KiwoomAPIError, requests.RequestException) as exc:
                     result.add_event(f"잔고 오류: {exc}")
         else:

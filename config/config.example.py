@@ -125,6 +125,10 @@ strategy_other_trail_activate_pct = 1.5
 strategy_other_trail_drawdown_pct = 1.0
 strategy_other_eod_sell_all = True
 strategy_other_flatten_overnight = True
+# 스윙: 재해 손절(−5%)만 자동 매도. 그 외는 텔레그램 제안.
+advise_sells_enabled = True
+strategy_disaster_stop_pct = 5.0
+advise_sell_ignore_cooldown_min = 20
 # 아침 모멘텀 채널: 장 초반 순위 급등 + 상승 중 종목 허용 (러너 포착)
 strategy_momentum_buy_enabled = True
 strategy_momentum_window_end = "10:00"

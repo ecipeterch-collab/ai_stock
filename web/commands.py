@@ -47,6 +47,30 @@ WEB_COMMAND_MENU: list[dict[str, Any]] = [
                 "args_label": "종목코드 [수량]",
                 "args_placeholder": "005930 1",
             },
+            {
+                "id": "sellok",
+                "label": "매도 승인",
+                "cmd": "/sellok",
+                "needs_args": True,
+                "args_label": "종목코드",
+                "args_placeholder": "001820",
+            },
+            {
+                "id": "sellhold",
+                "label": "매도 보류",
+                "cmd": "/sellhold",
+                "needs_args": True,
+                "args_label": "종목코드",
+                "args_placeholder": "001820",
+            },
+            {
+                "id": "buyok",
+                "label": "매수 확인",
+                "cmd": "/buyok",
+                "needs_args": True,
+                "args_label": "종목코드 수량",
+                "args_placeholder": "001820 1000",
+            },
             {"id": "trendbuy", "label": "트렌드 매수", "cmd": "/trendbuy"},
         ],
     },
@@ -106,6 +130,7 @@ def _command_failed(text: str) -> bool:
             "【매도 불가】",
             "【매수 실패】",
             "【매도 실패】",
+            "확인:",
         )
     ):
         return True

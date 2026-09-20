@@ -11,6 +11,8 @@ from config.config import (
     default_order_qty,
     dmst_stex_tp,
     notify_on_auto_events_only,
+    position_max_qty,
+    position_target_krw,
     strategy_mode as config_strategy_mode,
     telegram_chat_id,
     telegram_token,
@@ -18,7 +20,7 @@ from config.config import (
 )
 from kiwoom.client import KiwoomAPIError, KiwoomClient, get_shared_client
 from trading.strategy import AutoTradingStrategy, _is_token_auth_error
-from telegram.tel_send import send_message
+from telegram.tel_send import answer_callback_query, send_message
 from trading.mode_settings import (
     SETTINGS_FILE,
     get_auto_trading_enabled,
@@ -81,20 +83,24 @@ class TelegramTradingBot:
         ).start()
         return True
 
-    def notify(self, text: str) -> None:
+    def notify(self, text: str, *, reply_markup: dict | None = None) -> None:
         try:
-            send_message(text)
+            send_message(text, reply_markup=reply_markup)
         except requests.RequestException:
             pass
 
     def _notify_cycle_events(self, result) -> None:
+        button_map = {
+            msg: markup
+            for msg, markup in getattr(result, "button_events", []) or []
+        }
         messages = (
             result.events
             if notify_on_auto_events_only
             else result.messages
         )
         for message in messages:
-            self.notify(message)
+            self.notify(message, reply_markup=button_map.get(message))
 
     def _run_auto_cycle_silent_check(self) -> None:
         """주기 점검: 이벤트(체결·주문·실패)만 텔레그램 전송."""
@@ -125,8 +131,11 @@ class TelegramTradingBot:
             "/순위": self._cmd_rank,
             "/buy": self._cmd_buy,
             "/매수": self._cmd_buy,
+            "/buyok": self._cmd_buyok,
             "/sell": self._cmd_sell,
             "/매도": self._cmd_sell,
+            "/sellok": self._cmd_sellok,
+            "/sellhold": self._cmd_sellhold,
             "/auto": self._cmd_auto,
             "/자동": self._cmd_auto,
             "/strategy": self._cmd_strategy,
@@ -165,7 +174,10 @@ class TelegramTradingBot:
             f"/strategy - {strat} 매매 규칙\n"
             "/news - 시장·경제·지정학 뉴스 브리핑\n"
             "/buy 종목코드 [수량] - 시장가 매수\n"
+            "/buyok 종목코드 수량 - 한도 초과 매수 확인\n"
             "/sell 종목코드 [수량] - 시장가 매도\n"
+            "/sellok 종목코드 - 매도 제안 승인\n"
+            "/sellhold 종목코드 - 매도 제안 오늘 보류\n"
             f"/auto on|off - 자동매매 ({interval}초 주기, 이벤트만 알림)\n"
             "/report - 뉴스·잔고·점검 수동 리포트\n"
             "/pnl [YYYY-MM-DD] - 매매·손익 요약 (기본: 오늘)\n"
@@ -305,7 +317,37 @@ class TelegramTradingBot:
             "인자 예: /buy 005930 1  ·  /sell 035420 1"
         )
 
-    def _cmd_buy(self, args: list[str]) -> str:
+    def _manual_buy_needs_confirm(self, code: str, qty: int) -> bool:
+        if qty > int(position_max_qty):
+            return True
+        price = self._last_known_price(code)
+        if price > 0 and qty * price > int(position_target_krw) * 3:
+            return True
+        return False
+
+    def _last_known_price(self, code: str) -> int:
+        parse_price = getattr(self.client, "parse_price", None)
+        try:
+            holdings = self.client.get_holdings() or []
+        except Exception:
+            return 0
+        for item in holdings:
+            item_code = self.client.normalize_stock_code(item.get("stk_cd", ""))
+            if item_code != code:
+                continue
+            raw = item.get("cur_prc", "0")
+            if callable(parse_price):
+                try:
+                    return int(parse_price(raw) or 0)
+                except Exception:
+                    return 0
+            try:
+                return abs(int(str(raw).replace(",", "") or 0))
+            except (TypeError, ValueError):
+                return 0
+        return 0
+
+    def _cmd_buy(self, args: list[str], *, confirmed: bool = False) -> str:
         if not args:
             return "사용법: /buy 종목코드 [수량]"
         blocked = self._manual_order_market_guard("매수")
@@ -318,6 +360,11 @@ class TelegramTradingBot:
             return "사용법: /buy 종목코드 [수량]  (수량은 정수)"
         if qty <= 0:
             return "수량은 1주 이상이어야 합니다."
+        if not confirmed and self._manual_buy_needs_confirm(code, qty):
+            return (
+                f"확인: `/buyok {code} {qty}`\n"
+                f"수량이 자동 한도를 넘습니다 ({qty}주)."
+            )
 
         result = self.client.buy_market(code, qty, dmst_stex_tp=dmst_stex_tp)
         ord_no = result.get("ord_no", "")
@@ -350,6 +397,11 @@ class TelegramTradingBot:
             pass
         self.strategy._invalidate_holdings_cache()
         return "\n".join(lines)
+
+    def _cmd_buyok(self, args: list[str]) -> str:
+        if len(args) < 2:
+            return "사용법: /buyok 종목코드 수량"
+        return self._cmd_buy(args, confirmed=True)
 
     def _cmd_sell(self, args: list[str]) -> str:
         if not args:
@@ -429,6 +481,42 @@ class TelegramTradingBot:
             lines.append(fill_msg)
             threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()
         return "\n".join(lines)
+
+    def _cmd_sellok(self, args: list[str]) -> str:
+        if not args:
+            return "사용법: /sellok 종목코드"
+        blocked = self._manual_order_market_guard("매도")
+        if blocked:
+            return blocked
+        code = self.client.normalize_stock_code(args[0])
+        getter = getattr(self.strategy.proposals, "get_pending", None)
+        prop = getter(code) if callable(getter) else None
+        if prop is None:
+            return f"【매도 제안】 {code} 대기 중인 제안이 없습니다."
+        return self.strategy.execute_approved_sell(prop.id)
+
+    def _cmd_sellhold(self, args: list[str]) -> str:
+        if not args:
+            return "사용법: /sellhold 종목코드"
+        code = self.client.normalize_stock_code(args[0])
+        getter = getattr(self.strategy.proposals, "get_pending", None)
+        prop = getter(code) if callable(getter) else None
+        if prop is None:
+            return f"【매도 제안】 {code} 대기 중인 제안이 없습니다."
+        return self.strategy.hold_sell_proposal(prop.id)
+
+    def handle_callback_data(self, data: str) -> str:
+        parts = (data or "").split(":")
+        if len(parts) != 3 or parts[0] != "sell":
+            return "알 수 없는 버튼입니다."
+        action, pid = parts[1], parts[2]
+        if action == "ok":
+            return self.strategy.execute_approved_sell(pid)
+        if action == "hold":
+            return self.strategy.hold_sell_proposal(pid)
+        if action == "no":
+            return self.strategy.ignore_sell_proposal(pid)
+        return "알 수 없는 버튼입니다."
 
     def _cmd_auto(self, args: list[str]) -> str:
         if not args:
@@ -545,6 +633,10 @@ class TelegramTradingBot:
         return updates[-1]["update_id"] + 1
 
     def _handle_update(self, update: dict) -> None:
+        cq = update.get("callback_query")
+        if cq:
+            self._handle_callback_query(cq)
+            return
         message = update.get("message")
         if not message:
             return
@@ -561,6 +653,22 @@ class TelegramTradingBot:
         reply = self.handle_command(text)
         if reply:
             print(f"응답: {reply[:80]}...")
+            send_message(reply)
+
+    def _handle_callback_query(self, cq: dict) -> None:
+        message = cq.get("message") or {}
+        chat = message.get("chat") or {}
+        if TARGET_CHAT_ID is None or chat.get("id") != TARGET_CHAT_ID:
+            return
+        data = str(cq.get("data") or "")
+        cq_id = str(cq.get("id") or "")
+        reply = self.handle_callback_data(data)
+        try:
+            if cq_id:
+                answer_callback_query(cq_id, text=(reply or "")[:200])
+        except requests.RequestException:
+            pass
+        if reply:
             send_message(reply)
 
     def run(self) -> None:

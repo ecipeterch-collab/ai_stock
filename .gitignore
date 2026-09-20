@@ -19,6 +19,7 @@ config/cloudflared.yml
 data/positions.json
 data/trade_journal.jsonl
 data/news_sentiment.jsonl
+data/trade_proposals.json
 
 # IDE (optional local settings)
 .vscode/

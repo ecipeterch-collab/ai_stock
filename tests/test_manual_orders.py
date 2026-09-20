@@ -24,6 +24,10 @@ def _bot_with_mocks() -> TelegramTradingBot:
     bot.strategy.positions = MagicMock()
     bot.strategy.check_order_fill = MagicMock(return_value=None)
     bot.strategy._invalidate_holdings_cache = MagicMock()
+    bot.strategy.proposals = MagicMock()
+    bot.strategy.execute_approved_sell = MagicMock(return_value="ok")
+    bot.strategy.hold_sell_proposal = MagicMock(return_value="held")
+    bot.strategy.ignore_sell_proposal = MagicMock(return_value="ignored")
     bot.notify = MagicMock()
     return bot
 
@@ -81,6 +85,38 @@ def test_run_command_marks_api_error_as_not_ok(monkeypatch: pytest.MonkeyPatch) 
 
     assert result["ok"] is False
     assert "장종료" in result["text"] or "API 오류" in result["text"]
+
+
+def test_cmd_buy_rejects_oversize_until_buyok(monkeypatch: pytest.MonkeyPatch) -> None:
+    import trading.bot as bot_mod
+
+    monkeypatch.setattr(bot_mod, "is_market_open", lambda now=None: True)
+    monkeypatch.setattr(bot_mod, "position_max_qty", 100)
+    monkeypatch.setattr(bot_mod, "position_target_krw", 1_000_000)
+    bot = _bot_with_mocks()
+
+    msg = bot._cmd_buy(["001820", "1000"])
+
+    assert "확인:" in msg
+    assert "/buyok 001820 1000" in msg
+    bot.client.buy_market.assert_not_called()
+
+    ok = bot._cmd_buyok(["001820", "1000"])
+    bot.client.buy_market.assert_called_once_with("001820", 1000, dmst_stex_tp=bot_mod.dmst_stex_tp)
+    assert "[매수]" in ok
+
+
+def test_run_command_marks_buy_confirm_as_not_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = MagicMock()
+    fake.handle_command.return_value = (
+        "확인: `/buyok 001820 1000`\n수량이 자동 한도를 넘습니다 (1000주)."
+    )
+    monkeypatch.setattr("web.commands._get_bot", lambda: fake)
+
+    result = run_command("/buy 001820 1000")
+
+    assert result["ok"] is False
+    assert "확인:" in result["text"]
 
 
 def test_run_command_marks_market_closed_guard_as_not_ok(

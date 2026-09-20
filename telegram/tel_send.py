@@ -5,6 +5,9 @@ import requests
 from config.config import telegram_chat_id, telegram_token
 
 SEND_MESSAGE_URL = f"https://api.telegram.org/bot{telegram_token}/sendMessage"
+ANSWER_CALLBACK_URL = (
+    f"https://api.telegram.org/bot{telegram_token}/answerCallbackQuery"
+)
 
 
 def send_message(
@@ -13,6 +16,7 @@ def send_message(
     parse_mode: str | None = None,
     disable_notification: bool = False,
     timeout: float = 10,
+    reply_markup: dict | None = None,
 ) -> dict:
     """config.config의 telegram_chat_id, telegram_token으로 메시지를 전송한다.
 
@@ -21,6 +25,7 @@ def send_message(
         parse_mode: Telegram parse_mode (예: "HTML", "MarkdownV2").
         disable_notification: True이면 무음 알림으로 전송.
         timeout: HTTP 요청 타임아웃(초).
+        reply_markup: Telegram inline keyboard 등 reply_markup JSON.
 
     Returns:
         Telegram API 응답 JSON.
@@ -39,6 +44,8 @@ def send_message(
     }
     if parse_mode is not None:
         payload["parse_mode"] = parse_mode
+    if reply_markup is not None:
+        payload["reply_markup"] = reply_markup
 
     response = requests.post(SEND_MESSAGE_URL, json=payload, timeout=timeout)
     response.raise_for_status()
@@ -47,6 +54,30 @@ def send_message(
     if not data.get("ok"):
         raise RuntimeError(f"Telegram API 오류: {json.dumps(data, ensure_ascii=False)}")
 
+    return data
+
+
+def answer_callback_query(
+    callback_query_id: str,
+    text: str = "",
+    *,
+    show_alert: bool = False,
+    timeout: float = 10,
+) -> dict:
+    """인라인 버튼 탭에 대한 callback_query 응답."""
+    if not callback_query_id:
+        raise ValueError("callback_query_id는 비어 있을 수 없습니다.")
+    payload: dict = {
+        "callback_query_id": callback_query_id,
+        "show_alert": show_alert,
+    }
+    if text:
+        payload["text"] = text[:200]
+    response = requests.post(ANSWER_CALLBACK_URL, json=payload, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Telegram API 오류: {json.dumps(data, ensure_ascii=False)}")
     return data
 
 
