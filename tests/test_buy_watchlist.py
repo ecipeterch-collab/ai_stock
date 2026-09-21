@@ -1,4 +1,4 @@
-"""Every buy-phase cycle emits a candidate Telegram event."""
+"""Buy-candidate Telegram events: first ping, then throttle."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ def test_flush_without_buy_sends_candidate_event() -> None:
     strat._buy_watchlist = [("KB금융", "105560", 18.0), ("LG에너지솔루션", "373220", 10.0)]
     strat._buy_skip_reason = "일일 매수 한도 (10회)"
     result = AutoRunResult()
-    strat._flush_buy_watchlist(result, 0)
+    strat._flush_buy_watchlist(result, 0, now=1.0)
     assert len(result.events) == 1
     assert result.events[0].startswith("【매수 후보】")
     assert "매수 없음" in result.events[0]
@@ -30,8 +30,35 @@ def test_flush_without_buy_sends_candidate_event() -> None:
 def test_flush_empty_watchlist_still_notifies() -> None:
     strat = _flush_strategy()
     result = AutoRunResult()
-    strat._flush_buy_watchlist(result, 0)
+    strat._flush_buy_watchlist(result, 0, now=1.0)
     assert result.events[0].startswith("【매수 후보】 없음")
+
+
+def test_flush_same_watchlist_is_silent_even_after_interval() -> None:
+    strat = _flush_strategy()
+    strat._buy_watchlist = [("KB금융", "105560", 18.0)]
+    strat._buy_skip_reason = "일일 매수 한도 (10회)"
+    first = AutoRunResult()
+    strat._flush_buy_watchlist(first, 0, now=1.0)
+    second = AutoRunResult()
+    strat._flush_buy_watchlist(second, 0, now=1.0 + 20 * 60)
+    assert len(first.events) == 1
+    assert second.events == []
+
+
+def test_flush_new_list_waits_for_interval_then_sends() -> None:
+    strat = _flush_strategy()
+    strat._buy_watchlist = [("KB금융", "105560", 18.0)]
+    first = AutoRunResult()
+    strat._flush_buy_watchlist(first, 0, now=1.0)
+    strat._buy_watchlist = [("삼성SDI", "006400", 16.0)]
+    early = AutoRunResult()
+    strat._flush_buy_watchlist(early, 0, now=1.0 + 60)
+    later = AutoRunResult()
+    strat._flush_buy_watchlist(later, 0, now=1.0 + 15 * 60)
+    assert early.events == []
+    assert len(later.events) == 1
+    assert "삼성SDI" in later.events[0]
 
 
 def test_flush_after_buy_appends_and_does_not_duplicate() -> None:
@@ -39,11 +66,23 @@ def test_flush_after_buy_appends_and_does_not_duplicate() -> None:
     strat._buy_watchlist = [("삼성SDI", "006400", 16.0), ("KB금융", "105560", 18.0)]
     result = AutoRunResult()
     result.add_event("【자동매수】\n종목: 삼성SDI(006400)\n점수: 16.0점 · 차트\n")
-    strat._flush_buy_watchlist(result, 0)
+    strat._flush_buy_watchlist(result, 0, now=1.0)
     assert len(result.events) == 1
     assert "이번 후보" in result.events[0]
     assert "← 매수" in result.events[0]
     assert not any(e.startswith("【매수 후보】") for e in result.events)
+
+
+def test_flush_after_buy_appends_even_inside_interval() -> None:
+    strat = _flush_strategy()
+    strat._buy_watchlist = [("삼성SDI", "006400", 16.0)]
+    quiet = AutoRunResult()
+    strat._flush_buy_watchlist(quiet, 0, now=1.0)
+    result = AutoRunResult()
+    result.add_event("【자동매수】\n종목: 삼성SDI(006400)\n점수: 16.0점 · 차트\n")
+    strat._flush_buy_watchlist(result, 0, now=1.0 + 10)
+    assert "이번 후보" in result.events[0]
+    assert "← 매수" in result.events[0]
 
 
 def test_defensive_buy_phase_records_skip_reason(monkeypatch) -> None:

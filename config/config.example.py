@@ -270,6 +270,8 @@ drawdown_scale_channel_boost = ("crash",)
 drawdown_scale_momentum_mult_cap = 1.0
 
 notify_on_auto_events_only = True
+# 매수 후보 텔레그램: 같은 목록은 생략, 목록이 바뀌어도 이 간격 안에는 재알림 없음.
+buy_watchlist_notify_interval_min = 15
 # 체결·잔고 조회 실패 텔레그램 반복 알림 간격(초). 같은 오류는 이 시간 동안 생략.
 api_error_notify_cooldown_sec = 1800
 

@@ -167,6 +167,12 @@ try:
     from config.config import advise_sell_ignore_cooldown_min as advise_sell_ignore_cooldown_min
 except ImportError:
     advise_sell_ignore_cooldown_min = 20
+try:
+    from config.config import (
+        buy_watchlist_notify_interval_min as buy_watchlist_notify_interval_min,
+    )
+except ImportError:
+    buy_watchlist_notify_interval_min = 15
 from kiwoom.client import KiwoomAPIError, KiwoomClient
 from trading.market_utils import (
     calc_profit_pct,
@@ -372,6 +378,8 @@ class AutoTradingStrategy:
         self._drawdown = DrawdownScaleCalculator(client)
         self._cycle_ctx: MarketContext | None = None
         self._error_notify_state: dict[str, dict] = {}
+        self._last_watchlist_fp: tuple | None = None
+        self._last_watchlist_notify_at: float = 0.0
         self._seed_seen_fills_from_journal()
 
     def _seed_seen_fills_from_journal(self) -> None:
@@ -1067,6 +1075,7 @@ class AutoTradingStrategy:
                 f"  · 재진입 쿨다운 {strategy_reentry_cooldown_minutes}분 · "
                 "방어모드면 신규 금지\n"
                 "  · 전략점수·뉴스는 참고/알림 (방어·심리 중단선은 하드스톱)\n"
+                f"  · 매수 후보 텔레그램: 목록 바뀔 때만, 최소 {int(buy_watchlist_notify_interval_min)}분\n"
                 "  · ETF/ETN 제외 · 보유·미체결 제외\n"
                 if chart_primary_mode
                 else (
@@ -2384,7 +2393,29 @@ class AutoTradingStrategy:
             rows.append((cand.name, cand.code, score))
         self._buy_watchlist = rows
 
-    def _flush_buy_watchlist(self, result: AutoRunResult, events_before: int) -> None:
+    def _buy_watchlist_fingerprint(self) -> tuple:
+        rows = getattr(self, "_buy_watchlist", []) or []
+        skip = getattr(self, "_buy_skip_reason", None) or "후보 없음"
+        return (tuple(code for _, code, _ in rows[:3]), skip)
+
+    def _should_notify_buy_watchlist(self, fp: tuple, now: float) -> bool:
+        last_fp = getattr(self, "_last_watchlist_fp", None)
+        last_at = float(getattr(self, "_last_watchlist_notify_at", 0.0) or 0.0)
+        if fp == last_fp:
+            return False
+        interval = max(0, int(buy_watchlist_notify_interval_min)) * 60
+        if last_at > 0 and (now - last_at) < interval:
+            return False
+        return True
+
+    def _flush_buy_watchlist(
+        self,
+        result: AutoRunResult,
+        events_before: int,
+        *,
+        now: float | None = None,
+    ) -> None:
+        stamp = time.time() if now is None else float(now)
         bought_code: str | None = None
         bought_idx: int | None = None
         prefixes = ("【자동매수】", "【급락 매수】", "【트렌드 매수】", "【스캘핑 매수】")
@@ -2398,9 +2429,14 @@ class AutoTradingStrategy:
                     break
             break
         rows = getattr(self, "_buy_watchlist", []) or []
+        fp = self._buy_watchlist_fingerprint()
         if bought_idx is not None:
             extra = format_buy_watchlist(rows, bought_code=bought_code)
             result.events[bought_idx] = result.events[bought_idx].rstrip() + "\n" + extra
+            self._last_watchlist_fp = fp
+            self._last_watchlist_notify_at = stamp
+            return
+        if not self._should_notify_buy_watchlist(fp, stamp):
             return
         result.add_event(
             format_buy_watchlist(
@@ -2408,6 +2444,8 @@ class AutoTradingStrategy:
                 skip_reason=getattr(self, "_buy_skip_reason", None) or "후보 없음",
             )
         )
+        self._last_watchlist_fp = fp
+        self._last_watchlist_notify_at = stamp
 
     def _run_buy_phase(
         self,
