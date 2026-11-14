@@ -99,6 +99,10 @@ position_sizing_enabled = True
 position_target_krw = 1_000_000  # 종목당 목표 투입 금액(원)
 position_min_qty = 1
 position_max_qty = 100
+# 하루 매수 합계·1회 매수 금액은 보유자금(결제 예수금+보유평가)의 %.
+# 실행 중 변경: /budget 10  ·  /budget order 2
+daily_trade_pct = 10
+order_size_pct = 10
 position_addon_enabled = True
 position_addon_min_drop_pct = 5.0
 position_addon_quality_max_rank = 15

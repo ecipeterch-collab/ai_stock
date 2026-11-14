@@ -139,6 +139,9 @@ class TelegramTradingBot:
             "/sellhold": self._cmd_sellhold,
             "/sellask": self._cmd_sellask,
             "/매도문의": self._cmd_sellask,
+            "/budget": self._cmd_budget,
+            "/자금": self._cmd_budget,
+            "/거래비율": self._cmd_budget,
             "/auto": self._cmd_auto,
             "/자동": self._cmd_auto,
             "/strategy": self._cmd_strategy,
@@ -182,6 +185,9 @@ class TelegramTradingBot:
             "/sellask - 매도 문의 종목 (이 종목만 승인 후 매도)\n"
             "/sellask 종목코드 - 문의 종목 추가\n"
             "/sellask off 종목코드 - 문의 종목 해제\n"
+            "/budget - 보유자금 대비 하루·1회 매수 비율\n"
+            "/budget 10 - 하루 매수 한도를 보유자금의 10%로\n"
+            "/budget order 2 - 1회 매수를 보유자금의 2%로\n"
             "/sellok 종목코드 - 매도 제안 승인\n"
             "/sellhold 종목코드 - 매도 제안 오늘 보류\n"
             f"/auto on|off - 자동매매 ({interval}초 주기, 이벤트만 알림)\n"
@@ -324,6 +330,32 @@ class TelegramTradingBot:
             "이 종목만 텔레그램 승인 후 매도하고, 나머지는 자동으로 진행합니다."
         )
 
+    def _cmd_budget(self, args: list[str]) -> str:
+        from trading.account_settings import set_daily_trade_pct, set_order_size_pct
+
+        if not args:
+            return self.strategy.budget_text()
+        head = args[0].lower()
+        if head in ("order", "buy", "주문", "매수"):
+            if len(args) < 2:
+                return "사용법: /budget order 2"
+            try:
+                pct = set_order_size_pct(args[1])
+            except ValueError as exc:
+                return str(exc)
+            return f"1회 매수 {pct:g}% 로 설정했습니다.\n" + self.strategy.budget_text()
+        if head in ("day", "daily", "하루"):
+            if len(args) < 2:
+                return "사용법: /budget 10"
+            target = args[1]
+        else:
+            target = args[0]
+        try:
+            pct = set_daily_trade_pct(target)
+        except ValueError as exc:
+            return str(exc)
+        return f"하루 한도 {pct:g}% 로 설정했습니다.\n" + self.strategy.budget_text()
+
     def _cmd_strategy(self, _args: list[str]) -> str:
         return self.strategy.get_rules_summary()
 
@@ -408,6 +440,10 @@ class TelegramTradingBot:
             return "사용법: /buy 종목코드 [수량]  (수량은 정수)"
         if qty <= 0:
             return "수량은 1주 이상이어야 합니다."
+        price = self._last_known_price(code)
+        blocked_budget = self.strategy.manual_buy_block(qty, price)
+        if blocked_budget:
+            return blocked_budget
         if not confirmed and self._manual_buy_needs_confirm(code, qty):
             return (
                 f"확인: `/buyok {code} {qty}`\n"
@@ -424,7 +460,7 @@ class TelegramTradingBot:
         if fill_msg:
             lines.append(fill_msg)
             threading.Thread(target=self.notify, args=(fill_msg,), daemon=True).start()
-        fill_price = self.strategy.latest_fill_price(ord_no)
+        fill_price = self.strategy.latest_fill_price(ord_no) or price
         try:
             self.strategy.journal.log(
                 "buy_order",
@@ -437,6 +473,7 @@ class TelegramTradingBot:
             )
         except Exception:
             pass
+        self.strategy._note_buy_notional(qty, fill_price or 0)
         try:
             self.strategy.positions.register(
                 code, code, fill_price or 0, entry_qty=qty

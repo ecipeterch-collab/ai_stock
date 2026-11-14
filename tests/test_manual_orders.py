@@ -23,6 +23,8 @@ def _bot_with_mocks() -> TelegramTradingBot:
     bot.strategy.journal = MagicMock()
     bot.strategy.positions = MagicMock()
     bot.strategy.check_order_fill = MagicMock(return_value=None)
+    bot.strategy.manual_buy_block = MagicMock(return_value=None)
+    bot.strategy._note_buy_notional = MagicMock()
     bot.strategy._invalidate_holdings_cache = MagicMock()
     bot.strategy.proposals = MagicMock()
     bot.strategy.execute_approved_sell = MagicMock(return_value="ok")

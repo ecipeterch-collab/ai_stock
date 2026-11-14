@@ -46,6 +46,8 @@ def test_execute_buy_does_not_order_when_qty_zero(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
+    monkeypatch.setattr(strat, "_funds_krw", lambda: 10_000_000)
+    monkeypatch.setattr(strat, "_spent_today", lambda: 0)
     result = AutoRunResult()
     cand = CandidateView(
         code="000660",

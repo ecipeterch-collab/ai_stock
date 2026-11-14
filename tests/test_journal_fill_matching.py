@@ -188,6 +188,7 @@ def test_cmd_buy_logs_fill_price(monkeypatch: pytest.MonkeyPatch) -> None:
     bot.strategy = MagicMock()
     bot.strategy.check_order_fill.return_value = "체결"
     bot.strategy.latest_fill_price.return_value = 265248
+    bot.strategy.manual_buy_block.return_value = None
     bot.strategy.journal = MagicMock()
     bot.strategy.positions = MagicMock()
     bot.strategy._invalidate_holdings_cache = MagicMock()

@@ -102,6 +102,23 @@ WEB_COMMAND_MENU: list[dict[str, Any]] = [
                 "args_label": "원금(원)",
                 "args_placeholder": "500000000",
             },
+            {"id": "budget", "label": "거래 비율", "cmd": "/budget"},
+            {
+                "id": "budget_day",
+                "label": "하루 한도 %",
+                "cmd": "/budget",
+                "needs_args": True,
+                "args_label": "보유자금 대비 하루 매수 %",
+                "args_placeholder": "10",
+            },
+            {
+                "id": "budget_order",
+                "label": "1회 매수 %",
+                "cmd": "/budget order",
+                "needs_args": True,
+                "args_label": "보유자금 대비 1회 매수 %",
+                "args_placeholder": "2",
+            },
             {
                 "id": "pnl_date",
                 "label": "일자 손익",

@@ -176,7 +176,18 @@ from trading.runtime_config import (
     is_scalping_mode,
     mode_label,
 )
+from trading.account_settings import (
+    get_daily_trade_pct,
+    get_initial_capital,
+    get_order_size_pct,
+)
 from trading.mode_settings import is_sell_ask_code
+from trading.trade_budget import (
+    amount_from_pct,
+    format_budget_text,
+    funds_from_balances,
+    today_buy_notional,
+)
 from trading.chart_4h import completed_4h_bars, evaluate_4h_sell
 from trading.chart_signals import (
     ChartSignalAnalyzer,
@@ -314,6 +325,7 @@ class AutoTradingStrategy:
         self.enabled = False
         self._buy_count_date: date | None = None
         self._buy_count = 0
+        self._buy_notional_krw = 0
         self._trend_buy_count_date: date | None = None
         self._trend_buy_count = 0
         self._crash_buy_count_date: date | None = None
@@ -765,13 +777,23 @@ class AutoTradingStrategy:
         return None
 
     @staticmethod
-    def _base_order_qty(price: int, *, scale_mult: float = 1.0) -> int:
-        """종목당 목표 금액 기준 주문 수량. 비활성/가격 0이면 기본 수량."""
+    def _base_order_qty(
+        price: int,
+        *,
+        scale_mult: float = 1.0,
+        target_krw: int | None = None,
+    ) -> int:
+        """주문 수량. target_krw 가 있으면 그 금액, 없으면 종목당 목표 금액."""
         if not position_sizing_enabled or not price or price <= 0:
             return max(1, int(default_order_qty))
-        target = max(0, int(position_target_krw))
-        if target <= 0:
-            return max(1, int(default_order_qty))
+        if target_krw is None:
+            target = max(0, int(position_target_krw))
+            if target <= 0:
+                return max(1, int(default_order_qty))
+        else:
+            target = max(0, int(target_krw))
+            if target <= 0:
+                return 0
         if scale_mult > 0 and scale_mult != 1.0:
             target = int(target * scale_mult)
         if int(price) > target:
@@ -779,7 +801,101 @@ class AutoTradingStrategy:
         qty = target // int(price)
         qty = max(int(position_min_qty), int(qty))
         qty = min(int(position_max_qty), qty)
-        return max(1, qty)
+        if qty * int(price) > target:
+            qty = target // int(price)
+        return max(0, qty)
+
+    def _funds_krw(self) -> int:
+        """결제 예수금 + 보유평가. 조회 실패 시 시작 원금."""
+        cache = getattr(self, "_funds_cache", None)
+        now = time.monotonic()
+        if cache is not None and now - float(cache[0]) < 60:
+            return int(cache[1])
+        fallback = get_initial_capital()
+        cash = 0
+        holdings_eval = 0
+        try:
+            deposit = self.client.get_deposit() or {}
+            d2 = self.client.parse_price(str(deposit.get("d2_entra", "0")))
+            d1 = self.client.parse_price(str(deposit.get("d1_entra", "0")))
+            entr = self.client.parse_price(str(deposit.get("entr", "0")))
+            cash = int(d2 or d1 or entr or 0)
+            for item in self.client.get_holdings() or []:
+                qty = self.client.parse_qty(item.get("rmnd_qty", "0"))
+                if qty <= 0:
+                    continue
+                ev = self.client.parse_price(str(item.get("evlt_amt", "0")))
+                if ev <= 0:
+                    ev = self.client.parse_price(str(item.get("cur_prc", "0"))) * qty
+                holdings_eval += int(ev)
+        except Exception:
+            cash = 0
+            holdings_eval = 0
+        total = funds_from_balances(
+            cash=cash, holdings_eval=holdings_eval, fallback=fallback
+        )
+        self._funds_cache = (now, total)
+        return total
+
+    def _spent_today(self) -> int:
+        self._reset_daily_counter()
+        mem = int(getattr(self, "_buy_notional_krw", 0) or 0)
+        logged = 0
+        journal = getattr(self, "journal", None)
+        reader = getattr(journal, "read_all", None)
+        if callable(reader):
+            raw = reader()
+            if isinstance(raw, list):
+                logged = today_buy_notional(raw, date.today())
+        return max(mem, logged)
+
+    def _note_buy_notional(self, qty: int, price: int) -> None:
+        self._reset_daily_counter()
+        if qty > 0 and price > 0:
+            self._buy_notional_krw = int(getattr(self, "_buy_notional_krw", 0) or 0) + (
+                int(qty) * int(price)
+            )
+
+    def _daily_remaining_krw(self) -> int:
+        limit = amount_from_pct(self._funds_krw(), get_daily_trade_pct())
+        return max(0, limit - self._spent_today())
+
+    def _order_target_krw(self, scale_mult: float = 1.0) -> int:
+        order_amt = amount_from_pct(self._funds_krw(), get_order_size_pct())
+        if scale_mult > 0 and scale_mult != 1.0:
+            order_amt = int(order_amt * scale_mult)
+        return max(0, min(order_amt, self._daily_remaining_krw()))
+
+    def budget_text(self) -> str:
+        return format_budget_text(
+            funds=self._funds_krw(),
+            daily_pct=get_daily_trade_pct(),
+            order_pct=get_order_size_pct(),
+            spent=self._spent_today(),
+        )
+
+    def manual_buy_block(self, qty: int, price: int) -> str | None:
+        if qty <= 0 or price <= 0:
+            return None
+        need = int(qty) * int(price)
+        remain = self._daily_remaining_krw()
+        if need <= remain:
+            return None
+        return (
+            "【매수 불가】 하루 거래한도\n"
+            f"요청 {need:,}원 · 남은 한도 {remain:,}원 "
+            f"(보유자금의 {get_daily_trade_pct():g}%)\n"
+            "변경: /budget 10"
+        )
+
+    def _qty_skip_reason(self, name: str, code: str, price: int) -> str:
+        remain = self._daily_remaining_krw()
+        cap = self._order_target_krw()
+        return (
+            f"수량 0 스킵 - {name}({code}) "
+            f"1주 {int(price):,}원이 매수 한도 {cap:,}원 초과 "
+            f"(하루 {get_daily_trade_pct():g}% · 남음 {remain:,}원)"
+        )
 
     def _channel_scale_mult(self, channel: str) -> float:
         if not drawdown_scale_enabled or not self._cycle_ctx:
@@ -788,7 +904,8 @@ class AutoTradingStrategy:
 
     def _calc_order_qty(self, price: int, *, channel: str = "pullback") -> int:
         return self._base_order_qty(
-            price, scale_mult=self._channel_scale_mult(channel)
+            price,
+            target_krw=self._order_target_krw(self._channel_scale_mult(channel)),
         )
 
     def _buy_reason_prefix(self, channel: str) -> str:
@@ -1051,7 +1168,8 @@ class AutoTradingStrategy:
                 else ""
             )
             + (
-                f"  · 종목당 목표 {position_target_krw:,}원\n"
+                f"  · 보유자금의 하루 {get_daily_trade_pct():g}% · "
+                f"1회 매수 {get_order_size_pct():g}% · 최대 {position_max_qty}주\n"
                 if position_sizing_enabled
                 else ""
             )
@@ -1217,6 +1335,7 @@ class AutoTradingStrategy:
         if self._buy_count_date != today:
             self._buy_count_date = today
             self._buy_count = 0
+            self._buy_notional_krw = 0
             self._addon_buys_today = {}
         if self._trend_buy_count_date != today:
             self._trend_buy_count_date = today
@@ -2110,6 +2229,7 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             self._record_addon_buy(holding.code)
+            self._note_buy_notional(order_qty, holding.current_price)
             ord_no = order.get("ord_no", "")
             self.positions.add_to_position(
                 holding.code,
@@ -2790,10 +2910,7 @@ class AutoTradingStrategy:
         try:
             order_qty = self._calc_order_qty(candidate.current_price, channel="crash")
             if order_qty <= 0:
-                result.add_report(
-                    f"수량 0 스킵 - {candidate.name}({candidate.code}) "
-                    f"1주가 목표 {position_target_krw:,}원 초과"
-                )
+                result.add_report(self._qty_skip_reason(candidate.name, candidate.code, candidate.current_price))
                 return
             order = self.client.buy_market(
                 candidate.code,
@@ -2801,6 +2918,7 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             self._record_crash_buy()
+            self._note_buy_notional(order_qty, candidate.current_price)
             ord_no = order.get("ord_no", "")
             self.positions.register(
                 candidate.code,
@@ -2945,8 +3063,7 @@ class AutoTradingStrategy:
             order_qty = self._calc_order_qty(pick.current_price, channel="trend")
             if order_qty <= 0:
                 result.add_report(
-                    f"수량 0 스킵 - {pick.name}({pick.code}) "
-                    f"1주가 목표 {position_target_krw:,}원 초과"
+                    self._qty_skip_reason(pick.name, pick.code, pick.current_price)
                 )
                 return
             order = self.client.buy_market(
@@ -2955,6 +3072,7 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             self._record_trend_buy()
+            self._note_buy_notional(order_qty, pick.current_price)
             ord_no = order.get("ord_no", "")
             self.positions.register(
                 pick.code,
@@ -3015,9 +3133,8 @@ class AutoTradingStrategy:
                 candidate.current_price, channel=channel
             )
             if order_qty <= 0:
-                reason = (
-                    f"수량 0 스킵 - {candidate.name}({candidate.code}) "
-                    f"1주가 목표 {position_target_krw:,}원 초과"
+                reason = self._qty_skip_reason(
+                    candidate.name, candidate.code, candidate.current_price
                 )
                 self._mark_buy_skip(reason)
                 result.add_report(reason)
@@ -3028,6 +3145,7 @@ class AutoTradingStrategy:
                 dmst_stex_tp=dmst_stex_tp,
             )
             self._record_buy()
+            self._note_buy_notional(order_qty, candidate.current_price)
             ord_no = order.get("ord_no", "")
             self.positions.register(
                 candidate.code,
