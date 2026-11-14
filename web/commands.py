@@ -48,6 +48,19 @@ WEB_COMMAND_MENU: list[dict[str, Any]] = [
                 "args_placeholder": "005930 1",
             },
             {
+                "id": "sellask_list",
+                "label": "매도 문의 목록",
+                "cmd": "/sellask",
+            },
+            {
+                "id": "sellask",
+                "label": "매도 문의 추가",
+                "cmd": "/sellask",
+                "needs_args": True,
+                "args_label": "종목코드 (해제: off 종목코드)",
+                "args_placeholder": "005930",
+            },
+            {
                 "id": "sellok",
                 "label": "매도 승인",
                 "cmd": "/sellok",

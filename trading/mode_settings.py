@@ -85,3 +85,60 @@ def set_auto_trading_enabled(enabled: bool) -> None:
     data = _load_settings()
     data["auto_trading_enabled"] = bool(enabled)
     _save_settings(data)
+
+
+def normalize_ask_code(raw: str) -> str:
+    code = str(raw).split("_")[0].strip().upper()
+    if len(code) == 7 and code.startswith("A") and code[1:].isdigit():
+        code = code[1:]
+    if code.isdigit() and 1 <= len(code) <= 6:
+        code = code.zfill(6)
+    if len(code) != 6 or not code.isdigit():
+        raise ValueError(f"종목코드 6자리가 아닙니다: {raw}")
+    return code
+
+
+def get_sell_ask_codes() -> list[str]:
+    """매도 전에 사용자 확인을 받는 종목. 비어 있으면 전부 자동 매도."""
+    raw = _load_settings().get("sell_ask_codes") or []
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            code = normalize_ask_code(str(item))
+        except ValueError:
+            continue
+        if code not in seen:
+            seen.add(code)
+            out.append(code)
+    return out
+
+
+def is_sell_ask_code(code: str) -> bool:
+    try:
+        norm = normalize_ask_code(code)
+    except ValueError:
+        return False
+    return norm in set(get_sell_ask_codes())
+
+
+def add_sell_ask_code(code: str) -> list[str]:
+    norm = normalize_ask_code(code)
+    codes = get_sell_ask_codes()
+    if norm not in codes:
+        codes.append(norm)
+    data = _load_settings()
+    data["sell_ask_codes"] = codes
+    _save_settings(data)
+    return codes
+
+
+def remove_sell_ask_code(code: str) -> list[str]:
+    norm = normalize_ask_code(code)
+    codes = [c for c in get_sell_ask_codes() if c != norm]
+    data = _load_settings()
+    data["sell_ask_codes"] = codes
+    _save_settings(data)
+    return codes

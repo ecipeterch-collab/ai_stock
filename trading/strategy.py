@@ -36,17 +36,10 @@ from config.config import (
     position_addon_momentum_min_peak_pct,
     position_addon_max_per_day,
     position_addon_max_qty_multiplier,
-    strategy_swing_breakeven_activate_pct,
-    strategy_swing_breakeven_floor_pct,
-    strategy_swing_protect_trailing_activate_pct,
-    strategy_swing_protect_trailing_drawdown_pct,
-    strategy_swing_be_remainder_drawdown_pct,
     strategy_swing_exit_confirm_cycles,
     strategy_swing_exit_vol_lookback,
     strategy_swing_exit_vol_light_ratio,
     strategy_swing_exit_vol_heavy_ratio,
-    strategy_swing_stagnation_minutes,
-    strategy_swing_stagnation_max_profit_pct,
     strategy_loser_reentry_cooldown_hours,
     strategy_momentum_buy_enabled,
     strategy_momentum_window_end,
@@ -57,16 +50,12 @@ from config.config import (
     daily_loss_stop_pct,
     hard_stop_loss_pct,
     top_volume_rank_n,
-    news_defensive_loss_pct,
     news_enabled,
     news_filter_secondary,
     news_override_min_bullish_ratio,
     news_override_when_market_bullish,
     strategy_block_etf,
     strategy_block_leveraged_etf,
-    strategy_defensive_min_hold_minutes,
-    strategy_defensive_skip_overnight,
-    strategy_defensive_trailing_min_peak_pct,
     strategy_weak_market_min_bullish_count,
     strategy_weak_market_sentiment,
     scalping_disable_trend_buy,
@@ -104,26 +93,14 @@ from config.config import (
     strategy_exit_limit_price_ticks,
     strategy_exit_use_limit_orders,
     strategy_reentry_cooldown_minutes,
-    strategy_swing_eod_sell_all,
-    strategy_swing_eod_sell_if_below_pct,
-    strategy_swing_trailing_activate_pct,
-    strategy_swing_trailing_drawdown_pct,
     strategy_trend_max_buys_per_day,
-    strategy_breakeven_activate_pct,
-    strategy_breakeven_floor_pct,
     strategy_eod_cut_loss_enabled,
     strategy_eod_sell_enabled,
     strategy_min_flu_rt,
     strategy_max_flu_rt,
     strategy_min_score,
-    strategy_partial_sell_ratio,
     strategy_position_sync_grace_minutes,
     strategy_scan_rank_top,
-    strategy_stop_loss_pct,
-    strategy_take_profit_partial_pct,
-    strategy_take_profit_pct,
-    strategy_trailing_activate_pct,
-    strategy_trailing_drawdown_pct,
     trend_auto_buy_enabled,
     regime_enabled,
     drawdown_scale_enabled,
@@ -135,26 +112,6 @@ try:
     from config.config import api_error_notify_cooldown_sec as api_error_notify_cooldown_sec
 except ImportError:
     api_error_notify_cooldown_sec = 1800.0
-try:
-    from config.config import strategy_other_stop_loss_pct as strategy_other_stop_loss_pct
-except ImportError:
-    strategy_other_stop_loss_pct = 2.5
-try:
-    from config.config import strategy_other_trail_activate_pct as strategy_other_trail_activate_pct
-except ImportError:
-    strategy_other_trail_activate_pct = 1.5
-try:
-    from config.config import strategy_other_trail_drawdown_pct as strategy_other_trail_drawdown_pct
-except ImportError:
-    strategy_other_trail_drawdown_pct = 1.0
-try:
-    from config.config import strategy_other_eod_sell_all as strategy_other_eod_sell_all
-except ImportError:
-    strategy_other_eod_sell_all = True
-try:
-    from config.config import strategy_other_flatten_overnight as strategy_other_flatten_overnight
-except ImportError:
-    strategy_other_flatten_overnight = True
 try:
     from config.config import advise_sells_enabled as advise_sells_enabled
 except ImportError:
@@ -183,14 +140,12 @@ from trading.market_utils import (
 )
 from trading.journal_stats import build_daily_summary, format_daily_summary_text
 from trading.account_pnl import build_account_summary, format_account_summary_text
-from trading.account_settings import round_trip_cost_pct
 from trading.trade_proposals import (
     TradeProposalStore,
     format_buy_watchlist,
     format_sell_proposal_text,
     sell_proposal_markup,
 )
-from trading.mega_cap import is_mega_cap
 from trading.position_tracker import PositionState, PositionTracker
 from trading.news_analyzer import MarketNewsAnalyzer, MarketNewsContext
 from trading.news_priority import apply_bullish_news_override, news_score_gate
@@ -221,9 +176,12 @@ from trading.runtime_config import (
     is_scalping_mode,
     mode_label,
 )
+from trading.mode_settings import is_sell_ask_code
+from trading.chart_4h import completed_4h_bars, evaluate_4h_sell
 from trading.chart_signals import (
     ChartSignalAnalyzer,
     ChartSignalResult,
+    _parse_candle_minute,
     classify_exit_volume,
     latest_vs_avg_volume_ratio,
 )
@@ -349,7 +307,7 @@ class HoldingView:
 
 
 class AutoTradingStrategy:
-    """다중 점수 매수 + 분할익절/트레일링/본전스탑 + 뉴스·지정학 필터 (v3)."""
+    """차트 우선 매수. 스윙 매도는 4시간봉 신호와 재해 손절."""
 
     def __init__(self, client: KiwoomClient) -> None:
         self.client = client
@@ -375,6 +333,7 @@ class AutoTradingStrategy:
         self.trends = TrendScanner(client)
         self.journal = TradeJournal()
         self.chart = ChartSignalAnalyzer(client)
+        self._h4_cache: dict[str, tuple[float, str | None]] = {}
         self._drawdown = DrawdownScaleCalculator(client)
         self._cycle_ctx: MarketContext | None = None
         self._error_notify_state: dict[str, dict] = {}
@@ -895,7 +854,7 @@ class AutoTradingStrategy:
     @staticmethod
     def _exit_uses_market(reason: str) -> bool:
         """손절·본전스탑·방어 강제매도는 시장가. 트레일·익절은 지정가."""
-        if reason.startswith("손절"):
+        if reason.startswith("손절") or reason.startswith("재해 손절"):
             return True
         if reason.startswith("방어모드 매도"):
             return True
@@ -1018,53 +977,19 @@ class AutoTradingStrategy:
                 "■ /auto on · /report"
             )
         ms, me, as_, ae = effective_buy_windows()
-        _, eod = effective_eod_times()
         return (
             f"【매매 전략 · {mode_label()}】\n\n"
             f"점검 주기: {effective_auto_interval_sec()}초\n"
             f"동시 보유: 최대 {effective_max_positions()}종목\n"
             f"일반 매수: 최대 {effective_max_buys_per_day()}회/일 · "
             f"트렌드: {strategy_trend_max_buys_per_day}회/일\n\n"
-            "■ 매도\n"
-            "  · 시총 대형(삼성·하이닉스·NAVER 등 10종): "
-            f"손절 -{strategy_stop_loss_pct}% · 당일 강제청산 없음 · "
-            "본전스탑·수익보호 트레일\n"
-            f"  · 그 외: 손절 -{strategy_other_stop_loss_pct}% · "
-            f"고점 -{strategy_other_trail_drawdown_pct}%p 트레일 · "
-            "당일 마감 전량 · 오버나잇 금지\n"
-            f"  · 재해 손절 −{float(strategy_disaster_stop_pct):.0f}%만 자동 매도. "
-            "그 외 매도는 텔레그램 [매도]/[보류]/[무시]\n"
-            f"  · 대형 본전스탑: 고점 +{strategy_swing_breakeven_activate_pct}% 후 "
-            f"+{strategy_swing_breakeven_floor_pct}% 미만·왕복비용 이상이면 "
-            f"50%(1주는 전량), "
-            f"잔량은 고점-{strategy_swing_be_remainder_drawdown_pct}%p(바닥 0%) 트레일 · "
-            f"{strategy_swing_exit_confirm_cycles}회 확인 · "
-            f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
-            f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
-            f"  · 대형 수익보호 트레일: 고점 +{strategy_swing_protect_trailing_activate_pct}% "
-            f"→ -{strategy_swing_protect_trailing_drawdown_pct}%p · "
-            f"{strategy_swing_exit_confirm_cycles}회 확인 · "
-            f"거래량 {strategy_swing_exit_vol_light_ratio:.1f}x 미만 대기/"
-            f"{strategy_swing_exit_vol_heavy_ratio:.1f}x 이상 즉시\n"
-            f"  · 손절·본전스탑·방어·장마감 시장가, "
-            f"트레일 {'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
-            + (
-                "  · 정체 청산: 비활성\n"
-                if int(strategy_swing_stagnation_minutes) <= 0
-                else (
-                    f"  · 정체 청산: {strategy_swing_stagnation_minutes}분+ 보유 & "
-                    f"+{strategy_swing_stagnation_max_profit_pct:.1f}% 미만\n"
-                )
-            )
-            + (
-                f"  · 장마감: 대형 강제청산 없음"
-                + (
-                    f" · 그 외 {eod} 전량"
-                    if strategy_other_eod_sell_all
-                    else ""
-                )
-            )
-            + "\n\n"
+            "■ 매도 (4시간봉)\n"
+            "  · 60분봉을 09:00–13:00, 13:00–15:30 완성봉으로 합성\n"
+            "  · 종가가 20이평 아래이거나 약세 패턴(쌍봉·머리어깨·하락깃발·하락삼각형)이면 전량 매도\n"
+            "  · /sellask 로 지정한 종목만 텔레그램 승인. 나머지는 자동 매도\n"
+            f"  · 재해 손절 −{float(strategy_disaster_stop_pct):.0f}%는 지정 종목도 시장가 자동 매도\n"
+            f"  · 4시간 신호는 {'지정가' if strategy_exit_use_limit_orders else '시장가'}\n"
+            "\n"
             + (
                 "■ 매수 (차트 우선)\n"
                 f"  · 거래대금 상위 {strategy_scan_rank_top} → 차트 ≥{chart_min_score:.0f}점이 본결정\n"
@@ -1146,7 +1071,7 @@ class AutoTradingStrategy:
             + (
                 "■ 국면감지: 참고/알림 (매수 하드게이트 아님)\n"
                 "■ 차트우선: 모멘텀 차트는 +2~+4% 러너만 · 뉴스 심리 -0.70 이하면 매수중단\n"
-                "■ 방어모드: 당일 포지션만 (오버나잇은 손절)\n"
+                "■ 방어모드: 신규 매수 중단 (매도는 4시간봉·재해 손절)\n"
                 if chart_primary_mode and regime_enabled
                 else (
                     "■ 국면감지: 강세(모멘텀·눌림·추가) / 횡보(추가만) / "
@@ -1657,13 +1582,6 @@ class AutoTradingStrategy:
         if sellable <= 0:
             return None, 0, None
 
-        mega = is_mega_cap(holding.code)
-        entry_qty = getattr(state, "entry_qty", 0) if state else 0
-        if entry_qty <= 0:
-            entry_qty = holding.qty
-        already_sold = max(0, entry_qty - holding.qty)
-        stage_done = getattr(state, "tp_stage", 0) if state else 0
-
         if is_scalping_mode():
             hold_min = self.positions.holding_minutes(holding.code)
             reason, qty = evaluate_scalp_sell(
@@ -1677,153 +1595,41 @@ class AutoTradingStrategy:
             return reason, qty, None
 
         qty = sellable
-        peak = state.peak_profit_pct if state else profit
+        disaster = float(strategy_disaster_stop_pct)
+        if profit <= -disaster:
+            return f"재해 손절 ({profit:.2f}% <= -{disaster:g}%)", qty, None
 
-        if (
-            not mega
-            and strategy_other_flatten_overnight
-            and self.positions.is_overnight(holding.code)
-            and not (0 < profit < round_trip_cost_pct())
-        ):
-            return "오버나잇 금지 청산", qty, None
-
-        if not mega and self._is_eod_sell_all_time():
-            _, eod = effective_eod_times()
-            if (
-                is_scalping_mode()
-                or strategy_swing_eod_sell_all
-                or strategy_other_eod_sell_all
-            ) and not (0 < profit < round_trip_cost_pct()):
-                return f"장마감 전량 청산 ({eod})", qty, None
-            below = float(strategy_swing_eod_sell_if_below_pct)
-            if below > 0 and profit < below:
-                return (
-                    f"장마감 익절미달 정리 ({profit:.2f}% < +{below:.1f}%, {eod})",
-                    qty,
-                    None,
-                )
-
-        if not mega and self._is_eod_cut_loss_time() and profit < 0:
-            cut, _ = effective_eod_times()
-            return f"장마감 손실 정리 ({cut})", qty, None
-
-        stop_pct = (
-            float(strategy_stop_loss_pct)
-            if mega
-            else float(strategy_other_stop_loss_pct)
-        )
-        if profit <= -stop_pct:
-            return f"손절 ({profit:.2f}% <= -{stop_pct}%)", qty, None
-
-        if not mega:
-            act = float(strategy_other_trail_activate_pct)
-            dd = float(strategy_other_trail_drawdown_pct)
-            if peak >= act and profit < peak - dd:
-                return (
-                    f"중소형 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                    qty,
-                    None,
-                )
-        else:
-            stagnation_min = max(0, int(strategy_swing_stagnation_minutes))
-            if stagnation_min > 0:
-                hold_min = self.positions.holding_minutes(holding.code)
-                if (
-                    hold_min is not None
-                    and hold_min >= stagnation_min
-                    and profit < float(strategy_swing_stagnation_max_profit_pct)
-                ):
-                    return (
-                        f"정체 청산 (보유 {hold_min:.0f}분 ≥ {stagnation_min}분, "
-                        f"수익 {profit:.2f}% < "
-                        f"+{strategy_swing_stagnation_max_profit_pct:.1f}%)",
-                        qty,
-                        None,
-                    )
-
-            if stage_done >= 1 and peak >= strategy_swing_trailing_activate_pct:
-                trail_floor = peak - strategy_swing_trailing_drawdown_pct
-                if profit < trail_floor:
-                    return (
-                        f"트레일링 스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                        qty,
-                        None,
-                    )
-
-            be_scaled = bool(getattr(state, "be_scaled", False)) if state else False
-            if be_scaled:
-                remainder_dd = float(strategy_swing_be_remainder_drawdown_pct)
-                protect_floor = max(0.0, peak - remainder_dd)
-                if profit < protect_floor:
-                    return (
-                        f"본전스탑 잔량 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                        qty,
-                        None,
-                    )
-            elif peak >= strategy_swing_protect_trailing_activate_pct:
-                protect_floor = peak - strategy_swing_protect_trailing_drawdown_pct
-                if profit < protect_floor:
-                    return (
-                        f"수익보호 트레일링 (고점 {peak:.2f}% → 현재 {profit:.2f}%)",
-                        qty,
-                        None,
-                    )
-            if (
-                not be_scaled
-                and peak >= strategy_swing_breakeven_activate_pct
-                and profit < strategy_swing_breakeven_floor_pct
-                and profit >= round_trip_cost_pct()
-            ):
-                be_qty = self._calc_stage_sell_qty(
-                    entry_qty, sellable, already_sold, 0.50
-                )
-                if be_qty > 0:
-                    label = (
-                        f"본전스탑 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
-                        if entry_qty <= 1 or be_qty >= sellable
-                        else (
-                            f"본전스탑 50% 매도 (고점 {peak:.2f}% → 현재 {profit:.2f}%)"
-                        )
-                    )
-                    return label, be_qty, None
-
-        if news and news.defensive_mode:
-            skip_overnight = (
-                strategy_defensive_skip_overnight
-                and not is_scalping_mode()
-                and self.positions.is_overnight(holding.code)
-            )
-            hold_min = self.positions.holding_minutes(holding.code)
-            min_def_hold = (
-                0
-                if is_scalping_mode()
-                else max(0, int(strategy_defensive_min_hold_minutes))
-            )
-            in_grace = (
-                min_def_hold > 0
-                and hold_min is not None
-                and hold_min < min_def_hold
-            )
-            if not skip_overnight and not in_grace:
-                if profit <= news_defensive_loss_pct:
-                    return (
-                        f"방어모드 매도 (뉴스 악화, 수익 {profit:.2f}%)",
-                        qty,
-                        None,
-                    )
-                trail_peak = (
-                    1.0
-                    if is_scalping_mode()
-                    else max(1.0, float(strategy_defensive_trailing_min_peak_pct))
-                )
-                if peak >= trail_peak and profit < peak - 0.8:
-                    return (
-                        f"방어모드 트레일링 (리스크 {news.risk_score:.2f})",
-                        qty,
-                        None,
-                    )
-
+        chart_reason = self._chart_4h_reason(holding.code)
+        if chart_reason:
+            return chart_reason, qty, None
         return None, 0, None
+
+    def _chart_4h_reason(self, code: str, now: datetime | None = None) -> str | None:
+        """보유 종목 60분봉을 4시간봉으로 모아 매도 사유를 만든다. 실패 시 None."""
+        cache: dict[str, tuple[float, str | None]] = getattr(self, "_h4_cache", {})
+        self._h4_cache = cache
+        stamp = time.monotonic()
+        hit = cache.get(code)
+        if hit is not None and stamp - hit[0] < 300:
+            return hit[1]
+        reason: str | None = None
+        try:
+            raw = self.client.get_minute_chart(code, tic_scope="60")
+            if isinstance(raw, list):
+                candles = []
+                for row in raw:
+                    if not isinstance(row, dict):
+                        continue
+                    candle = _parse_candle_minute(row)
+                    if candle is not None:
+                        candles.append(candle)
+                reason = evaluate_4h_sell(
+                    completed_4h_bars(candles, now=now or datetime.now())
+                )
+        except Exception:
+            reason = None
+        cache[code] = (stamp, reason)
+        return reason
 
     def _log_sell_order(
         self,
@@ -2124,7 +1930,9 @@ class AutoTradingStrategy:
     def _should_auto_execute_sell(self, holding: HoldingView) -> bool:
         if is_scalping_mode() or not advise_sells_enabled:
             return True
-        return holding.profit_pct <= -float(strategy_disaster_stop_pct)
+        if holding.profit_pct <= -float(strategy_disaster_stop_pct):
+            return True
+        return not is_sell_ask_code(holding.code)
 
     def _propose_sell(
         self,

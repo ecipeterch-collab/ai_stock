@@ -18,6 +18,9 @@ def test_exit_uses_market_for_stop_breakeven_and_defensive_dump() -> None:
     )
     assert AutoTradingStrategy._exit_uses_market("오버나잇 금지 청산")
     assert AutoTradingStrategy._exit_uses_market("장마감 전량 청산 (15:20)")
+    assert AutoTradingStrategy._exit_uses_market(
+        "재해 손절 (-5.01% <= -5%)"
+    )
 
 
 def test_exit_keeps_limit_for_trailing_and_take_profit() -> None:
@@ -32,4 +35,7 @@ def test_exit_keeps_limit_for_trailing_and_take_profit() -> None:
     )
     assert not AutoTradingStrategy._exit_uses_market(
         "수익실현 +4% 50% 매도"
+    )
+    assert not AutoTradingStrategy._exit_uses_market(
+        "4시간 20이평 이탈 (종가 90 < 100)"
     )

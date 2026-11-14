@@ -29,6 +29,10 @@ class TradeProposal:
 
 def sell_proposal_category(reason: str) -> str:
     base = (reason or "").split(" / ")[0].strip()
+    if base.startswith("재해"):
+        return "disaster"
+    if base.startswith("4시간"):
+        return "chart_4h"
     if base.startswith("손절"):
         return "stop_loss"
     if "잔량 트레일링" in base:

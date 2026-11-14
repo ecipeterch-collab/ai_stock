@@ -91,7 +91,7 @@ def test_defensive_skips_overnight_hold_uses_stop_only(
     assert qty == 0
 
 
-def test_defensive_still_sells_same_day_loser(
+def test_defensive_mode_does_not_sell_without_4h_or_disaster(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -106,9 +106,8 @@ def test_defensive_still_sells_same_day_loser(
         _state(qty=2),
         news,
     )
-    assert reason is not None
-    assert "방어모드" in reason
-    assert qty == 2
+    assert reason is None
+    assert qty == 0
 
 
 def test_defensive_holds_small_same_day_red(

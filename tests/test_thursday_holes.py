@@ -160,7 +160,7 @@ def test_blocked_buy_codes_include_tracked_open_lot(tmp_path) -> None:
     assert "004310" in blocked
 
 
-def test_other_eod_skips_when_profit_below_round_trip(
+def test_eod_does_not_flatten_without_4h_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import trading.strategy as strat_mod
@@ -173,7 +173,6 @@ def test_other_eod_skips_when_profit_below_round_trip(
     s.positions.is_overnight.return_value = False
     monkeypatch.setattr(s, "_is_eod_sell_all_time", lambda now=None: True)
     monkeypatch.setattr(s, "_is_eod_cut_loss_time", lambda now=None: False)
-    monkeypatch.setattr(strat_mod, "round_trip_cost_pct", lambda: 0.23)
     reason, qty, _ = s._evaluate_sell(
         _holding("316140", "우리금융지주", 0.08, qty=56),
         _state(qty=56, peak=0.29),
@@ -182,7 +181,7 @@ def test_other_eod_skips_when_profit_below_round_trip(
     assert qty == 0
 
 
-def test_overnight_flatten_skips_tiny_green(
+def test_overnight_does_not_flatten_without_4h_signal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     import trading.strategy as strat_mod
@@ -195,7 +194,6 @@ def test_overnight_flatten_skips_tiny_green(
     s.positions.is_overnight.return_value = True
     monkeypatch.setattr(s, "_is_eod_sell_all_time", lambda now=None: False)
     monkeypatch.setattr(s, "_is_eod_cut_loss_time", lambda now=None: False)
-    monkeypatch.setattr(strat_mod, "round_trip_cost_pct", lambda: 0.23)
     reason, qty, _ = s._evaluate_sell(
         _holding("316140", "우리금융지주", 0.08, qty=56),
         _state(qty=56, peak=0.29),

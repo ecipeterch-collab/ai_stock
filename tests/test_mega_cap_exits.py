@@ -74,31 +74,25 @@ def test_mega_holds_through_minus_two_point_six(
     assert qty == 0
 
 
-def test_other_stops_at_minus_two_point_five(
+def test_other_percent_rules_do_not_sell(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """스윙 매도는 수익률·장마감·오버나잇이 아니라 4시간봉으로 결정한다."""
     strat = _strategy(monkeypatch)
-    reason, qty, _ = strat._evaluate_sell(
-        _holding(code="002990", name="금호건설", qty=10, profit=-2.6),
-        _state(qty=10, peak=0.0),
-    )
-    assert reason is not None
-    assert reason.startswith("손절")
-    assert "-2.5" in reason
-    assert qty == 10
-
-
-def test_other_tight_trail_from_peak(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    strat = _strategy(monkeypatch)
-    reason, qty, _ = strat._evaluate_sell(
-        _holding(code="002990", name="금호건설", qty=10, profit=1.8),
-        _state(qty=10, peak=3.0),
-    )
-    assert reason is not None
-    assert "중소형 트레일링" in reason
-    assert qty == 10
+    for profit, peak, overnight, eod in (
+        (-2.6, 0.0, False, False),
+        (1.8, 3.0, False, False),
+        (0.8, 1.2, False, True),
+        (0.4, 0.8, True, False),
+    ):
+        strat.positions.is_overnight.return_value = overnight
+        monkeypatch.setattr(strat, "_is_eod_sell_all_time", lambda now=None: eod)
+        reason, qty, _ = strat._evaluate_sell(
+            _holding(code="002990", name="금호건설", qty=10, profit=profit),
+            _state(qty=10, peak=peak),
+        )
+        assert reason is None
+        assert qty == 0
 
 
 def test_mega_skips_four_percent_take_profit(
@@ -113,7 +107,7 @@ def test_mega_skips_four_percent_take_profit(
     assert qty == 0 or reason is None
 
 
-def test_other_eod_flattens(
+def test_eod_and_overnight_do_not_flatten_without_4h(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -122,9 +116,17 @@ def test_other_eod_flattens(
         _holding(code="002990", name="금호건설", qty=10, profit=0.8),
         _state(qty=10, peak=1.2),
     )
-    assert reason is not None
-    assert "장마감 전량 청산" in reason
-    assert qty == 10
+    assert reason is None
+    assert qty == 0
+
+    strat.positions.is_overnight.return_value = True
+    monkeypatch.setattr(strat, "_is_eod_sell_all_time", lambda now=None: False)
+    reason, qty, _ = strat._evaluate_sell(
+        _holding(code="002990", name="금호건설", qty=10, profit=0.4),
+        _state(qty=10, peak=0.8),
+    )
+    assert reason is None
+    assert qty == 0
 
 
 def test_mega_skips_eod_flatten(
@@ -138,20 +140,6 @@ def test_mega_skips_eod_flatten(
     )
     assert reason is None
     assert qty == 0
-
-
-def test_other_overnight_flattens(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    strat = _strategy(monkeypatch)
-    strat.positions.is_overnight.return_value = True
-    reason, qty, _ = strat._evaluate_sell(
-        _holding(code="002990", name="금호건설", qty=10, profit=0.4),
-        _state(qty=10, peak=0.8),
-    )
-    assert reason is not None
-    assert "오버나잇" in reason
-    assert qty == 10
 
 
 def test_mega_overnight_not_flattened(

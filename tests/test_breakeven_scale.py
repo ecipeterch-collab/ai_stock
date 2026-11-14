@@ -1,4 +1,4 @@
-"""본전스탑 50% 스케일아웃 후 잔량 트레일링."""
+"""스윙 매도는 4시간봉 신호. 수익률 본전·트레일은 더 이상 매도 사유가 아니다."""
 
 from __future__ import annotations
 
@@ -46,34 +46,38 @@ def _state(*, qty: int, peak: float, be_scaled: bool = False) -> SimpleNamespace
     )
 
 
-def test_breakeven_stop_sells_half_when_qty_ge_2(
+def test_breakeven_and_trailing_do_not_sell_without_4h(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
+    cases = (
+        (_holding(qty=64, profit=0.40), _state(qty=64, peak=4.35)),
+        (_holding(qty=1, profit=0.40), _state(qty=1, peak=4.35)),
+        (_holding(qty=32, profit=-0.13), _state(qty=64, peak=4.35, be_scaled=True)),
+        (_holding(qty=2, profit=3.32), _state(qty=2, peak=5.15)),
+        (_holding(qty=50, profit=-0.10), _state(qty=100, peak=3.30, be_scaled=True)),
+    )
+    for holding, state in cases:
+        reason, qty, stage = strat._evaluate_sell(holding, state)
+        assert reason is None
+        assert qty == 0
+        assert stage is None
+
+
+def test_4h_signal_sells_full_qty(monkeypatch: pytest.MonkeyPatch) -> None:
+    strat = _strategy(monkeypatch)
+    monkeypatch.setattr(
+        strat,
+        "_chart_4h_reason",
+        lambda code, now=None: "4시간 20이평 이탈 (종가 90 < 100)",
+    )
     reason, qty, stage = strat._evaluate_sell(
         _holding(qty=64, profit=0.40),
         _state(qty=64, peak=4.35),
     )
-
     assert reason is not None
-    assert reason.startswith("본전스탑")
-    assert "50%" in reason
-    assert qty == 32
-    assert stage is None
-
-
-def test_breakeven_stop_sells_all_when_one_share(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    strat = _strategy(monkeypatch)
-    reason, qty, stage = strat._evaluate_sell(
-        _holding(qty=1, profit=0.40),
-        _state(qty=1, peak=4.35),
-    )
-
-    assert reason is not None
-    assert reason.startswith("본전스탑")
-    assert qty == 1
+    assert reason.startswith("4시간")
+    assert qty == 64
     assert stage is None
 
 
@@ -90,7 +94,7 @@ def test_breakeven_stop_skips_when_profit_below_round_trip_cost(
     assert qty == 0
 
 
-def test_breakeven_remainder_trails_after_scale_out(
+def test_breakeven_remainder_does_not_use_percent_trail(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -99,9 +103,8 @@ def test_breakeven_remainder_trails_after_scale_out(
         _state(qty=64, peak=4.35, be_scaled=True),
     )
 
-    assert reason is not None
-    assert "잔량 트레일링" in reason
-    assert qty == 32
+    assert reason is None
+    assert qty == 0
     assert stage is None
 
 
@@ -119,7 +122,7 @@ def test_breakeven_remainder_holds_when_above_trail_floor(
     assert qty == 0
 
 
-def test_protect_trailing_still_exits_full_before_breakeven(
+def test_protect_trailing_does_not_exit_without_4h(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -128,9 +131,8 @@ def test_protect_trailing_still_exits_full_before_breakeven(
         _state(qty=2, peak=5.15),
     )
 
-    assert reason is not None
-    assert "수익보호 트레일링" in reason
-    assert qty == 2
+    assert reason is None
+    assert qty == 0
 
 
 def test_mark_be_scaled_persists(tmp_path) -> None:
@@ -161,7 +163,7 @@ def test_be_remainder_holds_samsung_style_shallow_dip(
     assert qty == 0
 
 
-def test_be_remainder_exits_below_zero_floor(
+def test_shallow_dip_does_not_exit_on_percent_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     strat = _strategy(monkeypatch)
@@ -170,9 +172,8 @@ def test_be_remainder_exits_below_zero_floor(
         _state(qty=100, peak=3.30, be_scaled=True),
     )
 
-    assert reason is not None
-    assert "잔량 트레일링" in reason
-    assert qty == 50
+    assert reason is None
+    assert qty == 0
 
 
 def test_exit_confirm_blocks_first_touch(tmp_path) -> None:

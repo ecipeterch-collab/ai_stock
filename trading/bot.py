@@ -24,6 +24,7 @@ from telegram.tel_send import answer_callback_query, send_message
 from trading.mode_settings import (
     SETTINGS_FILE,
     get_auto_trading_enabled,
+    get_sell_ask_codes,
     set_auto_trading_enabled,
     set_strategy_mode,
 )
@@ -136,6 +137,8 @@ class TelegramTradingBot:
             "/매도": self._cmd_sell,
             "/sellok": self._cmd_sellok,
             "/sellhold": self._cmd_sellhold,
+            "/sellask": self._cmd_sellask,
+            "/매도문의": self._cmd_sellask,
             "/auto": self._cmd_auto,
             "/자동": self._cmd_auto,
             "/strategy": self._cmd_strategy,
@@ -176,6 +179,9 @@ class TelegramTradingBot:
             "/buy 종목코드 [수량] - 시장가 매수\n"
             "/buyok 종목코드 수량 - 한도 초과 매수 확인\n"
             "/sell 종목코드 [수량] - 시장가 매도\n"
+            "/sellask - 매도 문의 종목 (이 종목만 승인 후 매도)\n"
+            "/sellask 종목코드 - 문의 종목 추가\n"
+            "/sellask off 종목코드 - 문의 종목 해제\n"
             "/sellok 종목코드 - 매도 제안 승인\n"
             "/sellhold 종목코드 - 매도 제안 오늘 보류\n"
             f"/auto on|off - 자동매매 ({interval}초 주기, 이벤트만 알림)\n"
@@ -275,6 +281,48 @@ class TelegramTradingBot:
         else:
             lines.append("/auto on 으로 자동매매를 시작하세요.")
         return "\n".join(lines)
+
+    def _cmd_sellask(self, args: list[str]) -> str:
+        from trading.mode_settings import (
+            add_sell_ask_code,
+            remove_sell_ask_code,
+        )
+
+        if not args:
+            codes = get_sell_ask_codes()
+            if not codes:
+                return (
+                    "【매도 문의】 지정 종목 없음\n"
+                    "매도 신호는 전부 자동으로 진행합니다.\n"
+                    "추가: /sellask 005930"
+                )
+            lines = "\n".join(f"- {code}" for code in codes)
+            return (
+                "【매도 문의 종목】\n"
+                f"{lines}\n"
+                "이 종목만 승인 후 매도합니다. 나머지는 자동 매도입니다.\n"
+                "재해 손절(−5%)은 지정 종목도 바로 매도합니다.\n"
+                "해제: /sellask off 종목코드"
+            )
+        head = args[0].lower()
+        if head in ("off", "del", "remove", "해제"):
+            if len(args) < 2:
+                return "사용법: /sellask off 005930"
+            try:
+                left = remove_sell_ask_code(args[1])
+            except ValueError as exc:
+                return str(exc)
+            shown = ", ".join(left) if left else "없음"
+            return f"매도 문의에서 제외했습니다.\n남은 종목: {shown}"
+        try:
+            codes = add_sell_ask_code(args[0])
+        except ValueError as exc:
+            return str(exc)
+        shown = ", ".join(codes)
+        return (
+            f"매도 문의 종목: {shown}\n"
+            "이 종목만 텔레그램 승인 후 매도하고, 나머지는 자동으로 진행합니다."
+        )
 
     def _cmd_strategy(self, _args: list[str]) -> str:
         return self.strategy.get_rules_summary()

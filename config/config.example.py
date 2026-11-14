@@ -125,7 +125,8 @@ strategy_other_trail_activate_pct = 1.5
 strategy_other_trail_drawdown_pct = 1.0
 strategy_other_eod_sell_all = True
 strategy_other_flatten_overnight = True
-# 스윙: 재해 손절(−5%)만 자동 매도. 그 외는 텔레그램 제안.
+# 스윙 매도: 재해 손절(−5%)은 항상 자동.
+# 4시간봉 신호는 /sellask 로 지정한 종목만 텔레그램 문의하고, 나머지는 자동 매도.
 advise_sells_enabled = True
 strategy_disaster_stop_pct = 5.0
 advise_sell_ignore_cooldown_min = 20

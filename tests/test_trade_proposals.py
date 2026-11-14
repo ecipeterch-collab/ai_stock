@@ -18,6 +18,8 @@ def test_category_stop_and_eod() -> None:
     assert sell_proposal_category("손절 (-2.57% <= -2.5%)") == "stop_loss"
     assert sell_proposal_category("장마감 전량 청산 (15:20)") == "eod"
     assert sell_proposal_category("본전스탑 50% 매도 (고점 3.13% → 현재 0.46%)") == "breakeven"
+    assert sell_proposal_category("4시간 20이평 이탈 (종가 90 < 100)") == "chart_4h"
+    assert sell_proposal_category("재해 손절 (-5.01% <= -5%)") == "disaster"
 
 
 def test_upsert_pending_does_not_renotify_same_category(tmp_path: Path) -> None:
