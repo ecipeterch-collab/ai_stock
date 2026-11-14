@@ -9,6 +9,7 @@ def test_index_html_cache_busts_static_assets() -> None:
     html = render_index_html()
     assert 'src="/static/app.js?v=' in html
     assert 'href="/static/styles.css?v=' in html
+    assert 'id="command-code-picks"' in html
 
 
 def _access_record(msg: str) -> logging.LogRecord:

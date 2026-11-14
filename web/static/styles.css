@@ -334,6 +334,57 @@ input {
   font-size: 0.82rem;
 }
 
+.holding-code-row,
+.holding-actions,
+.code-pick-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.holding-code-row {
+  margin-bottom: 4px;
+}
+
+.code-chip,
+.code-pick-num {
+  font-family: ui-monospace, Consolas, monospace;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.code-chip {
+  background: var(--surface2);
+  padding: 2px 8px;
+  border-radius: 6px;
+}
+
+.holding-actions {
+  margin-top: 8px;
+}
+
+.code-picks {
+  margin-top: 8px;
+}
+
+.code-pick-hint {
+  margin: 0 0 6px;
+  font-size: 0.8rem;
+}
+
+.code-pick {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  text-align: left;
+  line-height: 1.25;
+}
+
+.code-pick-name {
+  font-size: 0.78rem;
+}
+
 .command-args {
   margin: 12px 0;
   padding: 12px;

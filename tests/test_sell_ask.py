@@ -65,3 +65,29 @@ def test_sellask_command_adds_lists_and_removes(
     removed = bot._cmd_sellask(["off", "105560"])
     assert "제외" in removed
     assert ms.get_sell_ask_codes() == []
+
+
+def test_sellask_lists_holding_names(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import trading.mode_settings as ms
+
+    monkeypatch.setattr(ms, "SETTINGS_FILE", tmp_path / "runtime_settings.json")
+    bot = TelegramTradingBot.__new__(TelegramTradingBot)
+
+    class _Holding:
+        def __init__(self, code: str, name: str) -> None:
+            self.code = code
+            self.name = name
+
+    class _Strategy:
+        def _parse_holdings(self):
+            return [_Holding("005930", "삼성전자")]
+
+        def holding_code_menu(self) -> str:
+            return "보유 종목코드\n- 삼성전자 005930"
+
+    bot.strategy = _Strategy()
+    ms.add_sell_ask_code("005930")
+    listed = bot._cmd_sellask([])
+    assert "삼성전자 005930" in listed
+    assert "보유 종목코드" in bot._cmd_buy([])
+    assert "005930" in bot._cmd_sell([])

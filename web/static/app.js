@@ -415,6 +415,67 @@ async function loadTradedStocks() {
   }
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[ch]
+  ));
+}
+
+function stockChoices() {
+  const seen = new Set();
+  const out = [];
+  for (const h of window.__lastHoldings || []) {
+    if (!h.code || seen.has(h.code)) continue;
+    seen.add(h.code);
+    out.push({
+      code: h.code,
+      name: h.name || h.code,
+      qty: h.sellable_qty || h.qty || 0,
+      held: true,
+    });
+  }
+  for (const s of tradedStocksCache || []) {
+    if (!s.code || seen.has(s.code)) continue;
+    seen.add(s.code);
+    out.push({ code: s.code, name: s.name || s.code, qty: 0, held: false });
+  }
+  return out;
+}
+
+const STOCK_COMMANDS = {
+  buy: {
+    id: "buy",
+    cmd: "/buy",
+    needs_args: true,
+    args_label: "종목코드 [수량]",
+    args_placeholder: "005930 1",
+  },
+  sell: {
+    id: "sell",
+    cmd: "/sell",
+    needs_args: true,
+    args_label: "종목코드 [수량]",
+    args_placeholder: "005930 1",
+  },
+  sellask: {
+    id: "sellask",
+    cmd: "/sellask",
+    needs_args: true,
+    args_label: "종목코드 (해제: off 종목코드)",
+    args_placeholder: "005930",
+  },
+};
+
+function openStockCommand(kind, code, qty) {
+  const item = STOCK_COMMANDS[kind];
+  if (!item) return;
+  openCommandArgs(item);
+  const input = $("command-arg-input");
+  if (kind === "sell" && qty > 0) input.value = `${code} ${qty}`;
+  else input.value = code;
+  input.focus();
+}
+
 function renderHoldings(holdings) {
   const list = $("holdings-list");
   const empty = $("holdings-empty");
@@ -431,19 +492,40 @@ function renderHoldings(holdings) {
     const li = document.createElement("li");
     li.className = "holding-item";
     const tags = (h.tags || [])
-      .map((t) => `<span class="tag">${t}</span>`)
+      .map((t) => `<span class="tag">${escapeHtml(t)}</span>`)
       .join("");
     const hold =
       h.hold_minutes != null ? ` · ${Math.round(h.hold_minutes)}분` : "";
     li.innerHTML = `
+      <div class="holding-code-row">
+        <span class="code-chip">${escapeHtml(h.code)}</span>
+        <span class="name">${escapeHtml(h.name)}</span>
+      </div>
       <header>
-        <span class="name">${h.name} <span class="muted">(${h.code})</span></span>
+        <span class="muted">${h.qty}주 · 매매가능 ${h.sellable_qty} · ${Number(h.current_price).toLocaleString()}원${hold}</span>
         <span class="${profitClass(h.profit_pct)}">${h.profit_pct >= 0 ? "+" : ""}${h.profit_pct}%</span>
       </header>
-      <p class="muted">${h.qty}주 · 매매가능 ${h.sellable_qty} · ${h.current_price.toLocaleString()}원${hold}</p>
       <p class="muted">고점 ${h.peak_profit_pct >= 0 ? "+" : ""}${h.peak_profit_pct}%</p>
       ${tags ? `<div class="tags">${tags}</div>` : ""}
+      <div class="holding-actions"></div>
     `;
+    const actions = li.querySelector(".holding-actions");
+    const sellBtn = document.createElement("button");
+    sellBtn.type = "button";
+    sellBtn.className = "btn ghost small";
+    sellBtn.textContent = "매도";
+    sellBtn.addEventListener("click", () => openStockCommand("sell", h.code, h.sellable_qty || h.qty || 0));
+    const askBtn = document.createElement("button");
+    askBtn.type = "button";
+    askBtn.className = "btn ghost small";
+    askBtn.textContent = "매도 문의";
+    askBtn.addEventListener("click", () => openStockCommand("sellask", h.code, 0));
+    const buyBtn = document.createElement("button");
+    buyBtn.type = "button";
+    buyBtn.className = "btn ghost small";
+    buyBtn.textContent = "매수";
+    buyBtn.addEventListener("click", () => openStockCommand("buy", h.code, 0));
+    actions.append(sellBtn, askBtn, buyBtn);
     list.appendChild(li);
   }
 }
@@ -567,7 +649,7 @@ function renderTrades(trades) {
         : "";
     const qty = t.qty != null ? ` ${t.qty}주` : "";
     const price = t.price != null ? ` @ ${t.price.toLocaleString()}` : "";
-    li.innerHTML = `${t.ts} · ${t.event} · ${t.name || t.code}${qty}${price}${pct}`;
+    li.innerHTML = `${escapeHtml(t.ts)} · ${escapeHtml(t.event)} · ${escapeHtml(t.name || "")} <span class="code-chip">${escapeHtml(t.code || "")}</span>${qty}${price}${pct}`;
     list.appendChild(li);
   }
 }
@@ -676,6 +758,60 @@ function hideCommandArgs() {
   pendingCommand = null;
   $("command-args-box").classList.add("hidden");
   $("command-arg-input").value = "";
+  const picks = $("command-code-picks");
+  if (picks) {
+    picks.innerHTML = "";
+    picks.classList.add("hidden");
+  }
+}
+
+function commandNeedsCode(item) {
+  return ["buy", "sell", "sellask", "sellok", "sellhold", "buyok"].includes(item.id);
+}
+
+function fillCommandCode(code, qty) {
+  const input = $("command-arg-input");
+  const id = pendingCommand && pendingCommand.id;
+  input.value = id === "sell" && qty > 0 ? `${code} ${qty}` : code;
+  input.focus();
+}
+
+function renderCodePicks(item) {
+  const box = $("command-code-picks");
+  if (!box) return;
+  box.innerHTML = "";
+  if (!commandNeedsCode(item)) {
+    box.classList.add("hidden");
+    return;
+  }
+  const heldOnly = item.id !== "buy" && item.id !== "buyok";
+  const choices = stockChoices().filter((s) => (heldOnly ? s.held : true));
+  if (!choices.length) {
+    box.classList.add("hidden");
+    return;
+  }
+  box.classList.remove("hidden");
+  const hint = document.createElement("p");
+  hint.className = "muted code-pick-hint";
+  hint.textContent = "종목을 누르면 코드가 입력됩니다";
+  box.appendChild(hint);
+  const row = document.createElement("div");
+  row.className = "code-pick-row";
+  for (const s of choices) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn ghost small code-pick";
+    const name = document.createElement("span");
+    name.className = "code-pick-name";
+    name.textContent = s.held ? s.name : `${s.name} · 최근`;
+    const num = document.createElement("span");
+    num.className = "code-pick-num";
+    num.textContent = s.code;
+    btn.append(name, num);
+    btn.addEventListener("click", () => fillCommandCode(s.code, s.qty));
+    row.appendChild(btn);
+  }
+  box.appendChild(row);
 }
 
 function openCommandArgs(item) {
@@ -688,10 +824,11 @@ function openCommandArgs(item) {
     if (h) preset = `${h.code} ${h.sellable_qty}`;
   }
   $("command-arg-input").value = preset;
+  renderCodePicks(item);
   $("command-args-box").classList.remove("hidden");
   $("command-args-box").scrollIntoView({ behavior: "smooth", block: "nearest" });
   $("command-arg-input").focus();
-  $("command-arg-input").select();
+  if (preset) $("command-arg-input").select();
 }
 
 async function executeCommandText(text, refreshAfter = false) {

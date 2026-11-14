@@ -288,6 +288,32 @@ class TelegramTradingBot:
             lines.append("/auto on 으로 자동매매를 시작하세요.")
         return "\n".join(lines)
 
+    def _holding_code_menu(self) -> str:
+        strat = getattr(self, "strategy", None)
+        menu = getattr(strat, "holding_code_menu", None)
+        if not callable(menu):
+            return ""
+        try:
+            return str(menu() or "")
+        except Exception:
+            return ""
+
+    def _named_ask_lines(self, codes: list[str]) -> str:
+        names: dict[str, str] = {}
+        strat = getattr(self, "strategy", None)
+        parser = getattr(strat, "_parse_holdings", None)
+        if callable(parser):
+            try:
+                for holding in parser():
+                    names[holding.code] = holding.name
+            except Exception:
+                names = {}
+        lines = []
+        for code in codes:
+            name = names.get(code)
+            lines.append(f"- {name} {code}" if name else f"- {code}")
+        return "\n".join(lines)
+
     def _cmd_sellask(self, args: list[str]) -> str:
         from trading.mode_settings import (
             add_sell_ask_code,
@@ -296,19 +322,22 @@ class TelegramTradingBot:
 
         if not args:
             codes = get_sell_ask_codes()
+            menu = self._holding_code_menu()
             if not codes:
                 return (
                     "【매도 문의】 지정 종목 없음\n"
                     "매도 신호는 전부 자동으로 진행합니다.\n"
-                    "추가: /sellask 005930"
+                    "추가: /sellask 005930\n\n"
+                    + menu
                 )
-            lines = "\n".join(f"- {code}" for code in codes)
+            lines = self._named_ask_lines(codes)
             return (
                 "【매도 문의 종목】\n"
                 f"{lines}\n"
                 "이 종목만 승인 후 매도합니다. 나머지는 자동 매도입니다.\n"
                 "재해 손절(−5%)은 지정 종목도 바로 매도합니다.\n"
-                "해제: /sellask off 종목코드"
+                "해제: /sellask off 종목코드\n\n"
+                + menu
             )
         head = args[0].lower()
         if head in ("off", "del", "remove", "해제"):
@@ -429,7 +458,7 @@ class TelegramTradingBot:
 
     def _cmd_buy(self, args: list[str], *, confirmed: bool = False) -> str:
         if not args:
-            return "사용법: /buy 종목코드 [수량]"
+            return "사용법: /buy 종목코드 [수량]\n\n" + self._holding_code_menu()
         blocked = self._manual_order_market_guard("매수")
         if blocked:
             return blocked
@@ -490,7 +519,7 @@ class TelegramTradingBot:
 
     def _cmd_sell(self, args: list[str]) -> str:
         if not args:
-            return "사용법: /sell 종목코드 [수량]"
+            return "사용법: /sell 종목코드 [수량]\n\n" + self._holding_code_menu()
         blocked = self._manual_order_market_guard("매도")
         if blocked:
             return blocked

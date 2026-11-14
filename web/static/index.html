@@ -226,10 +226,11 @@
           <h2>명령 · Help</h2>
           <span class="badge muted-badge">텔레그램 동일</span>
         </div>
-        <p class="muted cmd-hint">매수·매도는 종목코드와 수량이 필요합니다. 모의투자는 정규장(09:00~15:30)에만 주문됩니다. 결과는 아래에 표시됩니다.</p>
+        <p class="muted cmd-hint">보유 종목을 누르면 종목코드가 입력됩니다. 모의투자는 정규장(09:00~15:30)에만 주문됩니다.</p>
         <div id="command-groups" class="command-groups"></div>
         <div id="command-args-box" class="command-args hidden">
           <label id="command-args-label" for="command-arg-input">인자</label>
+          <div id="command-code-picks" class="code-picks hidden"></div>
           <div class="command-args-row">
             <input type="text" id="command-arg-input" autocomplete="off" />
             <button type="button" id="command-args-run" class="btn primary small">실행</button>

@@ -1287,6 +1287,19 @@ class AutoTradingStrategy:
             "상세 보유: /balance 또는 /portfolio"
         )
 
+    def holding_code_menu(self) -> str:
+        """수동 매수·매도·매도문의에서 종목코드를 바로 보여 준다."""
+        try:
+            holdings = self._parse_holdings()
+        except Exception:
+            return ""
+        if not holdings:
+            return "보유 종목코드 없음"
+        lines = ["보유 종목코드"]
+        for holding in holdings:
+            lines.append(f"- {holding.name} {holding.code}")
+        return "\n".join(lines)
+
     def build_balance_detail(self) -> str:
         """보유 종목 상세 (/balance)."""
         try:
